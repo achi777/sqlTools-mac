@@ -1,0 +1,69 @@
+# Local DB infrastructure for the DB Tool (Navicat-style desktop app).
+# Brings up PostgreSQL 16 and MySQL 8 for development.
+# Seed scripts under ./init/<engine> run ONCE on first container init
+# (i.e. when the named volume is empty). SQLite is file-based and NOT here.
+#
+# Usage (from this docker/ folder):
+#   docker compose up -d
+#   docker compose ps
+services:
+  postgres:
+    image: postgres:16
+    container_name: dbtool-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: dbtool
+      POSTGRES_PASSWORD: dbtool
+      POSTGRES_DB: dbtool_dev
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init/postgres:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dbtool"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 768M
+    restart: unless-stopped
+    networks:
+      - dbtool-net
+
+  mysql:
+    image: mysql:8
+    container_name: dbtool-mysql
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+      MYSQL_DATABASE: dbtool_dev
+      MYSQL_USER: dbtool
+      MYSQL_PASSWORD: dbtool
+    volumes:
+      - mysqldata:/var/lib/mysql
+      - ./init/mysql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -prootpw"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 768M
+    restart: unless-stopped
+    networks:
+      - dbtool-net
+
+networks:
+  dbtool-net:
+    driver: bridge
+
+volumes:
+  pgdata:
+  mysqldata:

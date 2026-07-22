@@ -1,0 +1,83 @@
+# electron-builder configuration for the DB Tool desktop app.
+# Produces an unsigned Windows NSIS installer + a portable single .exe.
+# End users need NO Node.js — the Electron runtime is bundled.
+appId: com.dbtool.app
+productName: DB Tool
+# No auto-update server configured; disable publish to avoid channel errors.
+publish: null
+# Copyright shown in the exe metadata.
+copyright: Copyright © 2026 DB Tool
+
+# The built app lives in ./out (electron-vite output). We ship that plus the
+# whitelisted production node_modules (drivers). package.json "main" points at
+# out/main/index.js.
+directories:
+  output: release
+  buildResources: build
+
+files:
+  - out/**
+  - package.json
+  # Production dependencies (pg, mysql2, better-sqlite3 + their deps) are
+  # included automatically by electron-builder; devDependencies are excluded.
+
+# Native module rebuild. On macOS Xcode CLT provides a C++ toolchain so
+# electron-builder can recompile better-sqlite3 for the correct Electron ABI
+# automatically. On Windows without a toolchain set this to false and use a
+# prebuilt binary instead (see README).
+npmRebuild: true
+nodeGypRebuild: false
+
+# Native .node binaries cannot be loaded from inside an asar archive, so unpack
+# better-sqlite3 (and any other .node) into app.asar.unpacked/.
+asar: true
+asarUnpack:
+  - "**/*.node"
+  - "node_modules/better-sqlite3/**"
+
+mac:
+  icon: build/icon.png
+  artifactName: DBTool-${version}-${arch}-mac.${ext}
+  identity: "ALL PAY WAY, LLC (2UUD29Z4Q3)"
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  notarize:
+    teamId: "2UUD29Z4Q3"
+  target:
+    - target: dmg
+      arch:
+        - arm64
+        - x64
+    - target: zip
+      arch:
+        - arm64
+        - x64
+
+win:
+  icon: build/icon.ico
+  artifactName: DBTool-${version}-${arch}-win.${ext}
+  # No code signing (unsigned build — see README). Explicitly avoid any signing.
+  signAndEditExecutable: true
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: portable
+      arch:
+        - x64
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: DB Tool
+  # Friendly installer file name: DBTool-Setup-<version>.exe
+  artifactName: DBTool-Setup-${version}.exe
+
+portable:
+  # Friendly portable file name: DBTool-<version>-portable.exe
+  artifactName: DBTool-${version}-portable.exe
