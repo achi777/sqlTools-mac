@@ -1,8 +1,0 @@
-# Real environment config (never commit credentials)
-.env
-
-# SQLite database files (created at runtime, incl. throwaway _verify.sqlite)
-db/sqlite/*.sqlite
-
-# Node dependencies
-node_modules/
