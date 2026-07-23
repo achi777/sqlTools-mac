@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   DataEditor,
   GridCellKind,
@@ -16,6 +16,7 @@ import { useStore } from '../store'
 import { PaginationBar } from './PaginationBar'
 import { ColumnFilterPopover, type PopoverAnchor } from './ColumnFilterPopover'
 import { FunnelFilterPopover, type FunnelAnchor } from './FunnelFilterPopover'
+import { SavedFiltersPopover, type SavedAnchor } from './SavedFiltersPopover'
 import { CustomWhereBar } from './CustomWhereBar'
 import { FilterSqlPanel } from './FilterSqlPanel'
 import {
@@ -26,7 +27,8 @@ import {
   IconDiscard,
   IconDelete,
   IconExport,
-  IconImport
+  IconImport,
+  IconSave
 } from '../actionIcons'
 
 function toDisplay(value: unknown): string {
@@ -38,7 +40,7 @@ function toDisplay(value: unknown): string {
 // Dark theme for the grid so it matches the app AND so the cell/overlay text
 // stays LIGHT — otherwise the tinted (green/blue/red) staged cells render dark
 // text on a dark background and what you type is invisible.
-const GRID_THEME = {
+const DARK_GRID_THEME = {
   accentColor: '#7c9cff',
   accentFg: '#12121c',
   accentLight: 'rgba(124,156,255,0.25)',
@@ -63,11 +65,46 @@ const GRID_THEME = {
   linkColor: '#7c9cff'
 }
 
-// Tints for staged cells — dark backgrounds paired with LIGHT text so typed
-// values remain readable while editing.
-const TINT_NEW = { bgCell: '#26332b', textDark: '#e4e4ef' }
-const TINT_EDIT = { bgCell: '#2c3350', textDark: '#e4e4ef' }
-const TINT_DELETE = { bgCell: '#4a2530', textDark: '#ff9aa2' }
+// Light grid theme — mirrors the light CSS token palette.
+const LIGHT_GRID_THEME = {
+  accentColor: '#3b6fe0',
+  accentFg: '#ffffff',
+  accentLight: 'rgba(59,111,224,0.18)',
+  textDark: '#1f2330',
+  textMedium: '#3a4055',
+  textLight: '#63697b',
+  textBubble: '#1f2330',
+  bgIconHeader: '#63697b',
+  fgIconHeader: '#ffffff',
+  textHeader: '#3a4055',
+  textHeaderSelected: '#1f2330',
+  bgCell: '#ffffff',
+  bgCellMedium: '#f6f7f9',
+  bgHeader: '#eceef2',
+  bgHeaderHasFocus: '#e2e5ec',
+  bgHeaderHovered: '#e6e9f0',
+  bgBubble: '#eceef2',
+  bgBubbleSelected: '#dfe6f7',
+  bgSearchResult: '#fff3c4',
+  borderColor: '#d3d7df',
+  drilldownBorder: '#d3d7df',
+  linkColor: '#3b6fe0'
+}
+
+// Tints for staged cells — per theme (dark keeps light text on dark tints;
+// light keeps dark text on pale tints so typed values stay readable).
+const DARK_TINTS = {
+  new: { bgCell: '#26332b', textDark: '#e4e4ef' },
+  edit: { bgCell: '#2c3350', textDark: '#e4e4ef' },
+  delete: { bgCell: '#4a2530', textDark: '#ff9aa2' },
+  filtered: { bgHeader: '#33406a', bgHeaderHovered: '#3a4a7a' }
+}
+const LIGHT_TINTS = {
+  new: { bgCell: '#e4f3e8', textDark: '#1f2330' },
+  edit: { bgCell: '#e4ecfb', textDark: '#1f2330' },
+  delete: { bgCell: '#fbe3e6', textDark: '#8a2523' },
+  filtered: { bgHeader: '#dce6fb', bgHeaderHovered: '#cdd9f5' }
+}
 
 export function DataGrid(): JSX.Element {
   const activeTab = useStore((s) => s.getActiveTab())
@@ -82,6 +119,9 @@ export function DataGrid(): JSX.Element {
   const openExport = useStore((s) => s.openExport)
   const openImport = useStore((s) => s.openImport)
   const engineOf = useStore((s) => s.engineOf)
+  const themeMode = useStore((s) => s.theme)
+  const gridTheme = themeMode === 'light' ? LIGHT_GRID_THEME : DARK_GRID_THEME
+  const tints = themeMode === 'light' ? LIGHT_TINTS : DARK_TINTS
 
   const [selection, setSelection] = useState<GridSelection>({
     columns: CompactSelection.empty(),
@@ -89,6 +129,16 @@ export function DataGrid(): JSX.Element {
   })
   const [filterAnchor, setFilterAnchor] = useState<PopoverAnchor | null>(null)
   const [funnelAnchor, setFunnelAnchor] = useState<FunnelAnchor | null>(null)
+  const [savedAnchor, setSavedAnchor] = useState<SavedAnchor | null>(null)
+  const savedBtnRef = useRef<HTMLButtonElement | null>(null)
+  // Tools ▸ Saved Filters (native menu, TASK 72) bumps savedFiltersSignal — open
+  // the same popover the toolbar button opens, anchored to that button.
+  const savedFiltersSignal = useStore((s) => s.savedFiltersSignal)
+  useEffect(() => {
+    if (savedFiltersSignal === 0 || !savedBtnRef.current) return
+    const r = savedBtnRef.current.getBoundingClientRect()
+    setSavedAnchor({ x: r.left, y: r.bottom + 4 })
+  }, [savedFiltersSignal])
 
   const result = activeTab?.result ?? null
   const resultError = activeTab?.resultError ?? null
@@ -143,12 +193,10 @@ export function DataGrid(): JSX.Element {
         id: c.name,
         width: Math.min(280, Math.max(90, c.name.length * 9 + 90)),
         hasMenu: isTable,
-        themeOverride: filteredCols.has(c.name)
-          ? { bgHeader: '#33406a', bgHeaderHovered: '#3a4a7a' }
-          : undefined
+        themeOverride: filteredCols.has(c.name) ? tints.filtered : undefined
       }
     })
-  }, [result, colMeta, pkCols, sort, filteredCols, isTable])
+  }, [result, colMeta, pkCols, sort, filteredCols, isTable, tints])
 
   // Header menu (⋯) opens the per-column quick-filter popover.
   const onHeaderMenuClick = useCallback(
@@ -200,7 +248,7 @@ export function DataGrid(): JSX.Element {
           displayData: display,
           allowOverlay: editable,
           readonly: !editable,
-          themeOverride: isDeleted ? TINT_DELETE : hasEdit ? TINT_EDIT : undefined
+          themeOverride: isDeleted ? tints.delete : hasEdit ? tints.edit : undefined
         }
       }
 
@@ -223,10 +271,10 @@ export function DataGrid(): JSX.Element {
         displayData: display || placeholder,
         allowOverlay: isTable && !isAuto,
         readonly: !isTable || isAuto,
-        themeOverride: TINT_NEW
+        themeOverride: tints.new
       }
     },
-    [result, colMeta, pkCols, dataRows, pending, rowKeyOf, isTable, hasPk]
+    [result, colMeta, pkCols, dataRows, pending, rowKeyOf, isTable, hasPk, tints]
   )
 
   const onCellEdited = useCallback(
@@ -336,6 +384,18 @@ export function DataGrid(): JSX.Element {
               <IconCustomWhere />
               {activeTab?.customWhere?.trim() && <span className="funnel-dot" />}
             </button>
+            <button
+              ref={savedBtnRef}
+              className="icon-text-btn icon-only"
+              onClick={(e) => {
+                const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
+                setSavedAnchor(savedAnchor ? null : { x: r.left, y: r.bottom + 4 })
+              }}
+              title="Saved filters — save or apply a named filter for this table"
+              aria-label="Saved filters"
+            >
+              <IconSave />
+            </button>
           </span>
           {activeHasFilter && (
             <button className="icon-text-btn danger" onClick={() => void clearAllFilters()} title="Clear the active filter">
@@ -382,8 +442,17 @@ export function DataGrid(): JSX.Element {
           onHeaderMenuClick={isTable ? onHeaderMenuClick : undefined}
           gridSelection={selection}
           onGridSelectionChange={setSelection}
+          onKeyDown={(e) => {
+            // Delete staged the SELECTED ROWS for deletion (reversible until Apply)
+            // — only when whole rows are selected, so cell-level Delete still clears
+            // a cell. Confirmation is the visible staged (red) state + explicit Apply.
+            if ((e.key === 'Delete' || e.key === 'Backspace') && isTable && hasPk && selection.rows.length > 0) {
+              deleteSelectedRows()
+              e.preventDefault()
+            }
+          }}
           rowMarkers={isTable && hasPk ? 'checkbox' : 'number'}
-          theme={GRID_THEME}
+          theme={gridTheme}
           width="100%"
           height="100%"
           smoothScrollX
@@ -408,6 +477,9 @@ export function DataGrid(): JSX.Element {
           columns={spec.columns}
           onClose={() => setFunnelAnchor(null)}
         />
+      )}
+      {savedAnchor && gridTable && (
+        <SavedFiltersPopover anchor={savedAnchor} onClose={() => setSavedAnchor(null)} />
       )}
     </div>
   )

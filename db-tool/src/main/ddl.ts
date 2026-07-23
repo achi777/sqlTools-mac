@@ -725,6 +725,38 @@ export function buildTableDdl(
   }
 }
 
+// --- transfer helpers (used by the cross-engine data-transfer feature) --------
+
+/**
+ * The column type a given column would get on `engine` — the exact string the
+ * transfer planner shows and CREATE TABLE emits. Reuses the per-engine type
+ * translation (oracle/mssql specials + the shared type catalog).
+ */
+export function targetColumnType(engine: Engine, col: ColumnSpec): string {
+  return renderType(sqlDialect(engine), col)
+}
+
+/**
+ * ALTER TABLE ADD [CONSTRAINT] FOREIGN KEY … for each FK in `spec`. A transfer
+ * creates tables WITHOUT foreign keys, loads all data, then adds the FKs last,
+ * so referential integrity is validated once every row is present.
+ */
+export function buildAddForeignKeys(engine: Engine, spec: TableSpec): string[] {
+  engine = sqlDialect(engine)
+  const q = (s: string): string => quote(engine, s)
+  const t = qualified(engine, spec.schema, spec.name)
+  return spec.foreignKeys.map((fk) => {
+    const named = fk.name ? `CONSTRAINT ${q(fk.name)} ` : ''
+    return `ALTER TABLE ${t} ADD ${named}${fkClause(engine, fk)}`
+  })
+}
+
+/** CREATE INDEX statements for a spec (run separately so a name clash doesn't abort the table). */
+export function buildCreateIndexes(engine: Engine, spec: TableSpec): string[] {
+  engine = sqlDialect(engine)
+  return spec.indexes.map((idx) => createIndexStmt(engine, spec, idx))
+}
+
 export function buildObjectOp(engine: Engine, op: ObjectOp): DdlPreview {
   engine = sqlDialect(engine)
   const q = (s: string): string => quote(engine, s)
@@ -752,7 +784,14 @@ export function buildObjectOp(engine: Engine, op: ObjectOp): DdlPreview {
       else notes.push('Renaming a database is not supported on this engine.')
       break
     case 'dropTable':
-      statements.push(`DROP TABLE ${qualified(engine, op.schema, op.table)}`)
+      if (engine === 'oracle') {
+        // CASCADE CONSTRAINTS drops FKs that reference this table; PURGE skips
+        // the recycle bin (the table cannot be FLASHBACK-restored afterwards).
+        statements.push(`DROP TABLE ${qualified(engine, op.schema, op.table)} CASCADE CONSTRAINTS PURGE`)
+        notes.push('Oracle: CASCADE CONSTRAINTS drops referencing foreign keys; PURGE bypasses the recycle bin (no FLASHBACK restore).')
+      } else {
+        statements.push(`DROP TABLE ${qualified(engine, op.schema, op.table)}`)
+      }
       destructiveReasons.push(`drops table "${op.table}" and all its rows`)
       break
     case 'truncateTable':
@@ -825,6 +864,37 @@ export function buildObjectOp(engine: Engine, op: ObjectOp): DdlPreview {
         statements.push(`DROP INDEX ${qualified(engine, op.schema, op.name)}`)
       }
       destructiveReasons.push(`drops index "${op.name}" on "${op.table}"`)
+      break
+
+    // --- PostgreSQL advanced objects (TASK 67) ---
+    case 'dropMatView':
+      statements.push(`DROP MATERIALIZED VIEW ${qualified(engine, op.schema, op.name)}`)
+      destructiveReasons.push(`drops materialized view "${op.name}" and its stored data`)
+      break
+    case 'refreshMatView':
+      statements.push(`REFRESH MATERIALIZED VIEW ${op.concurrently ? 'CONCURRENTLY ' : ''}${qualified(engine, op.schema, op.name)}`)
+      if (op.concurrently) notes.push('CONCURRENTLY requires a UNIQUE index on the materialized view; PostgreSQL errors otherwise.')
+      break
+    case 'dropType':
+      statements.push(`DROP TYPE ${qualified(engine, op.schema, op.name)}${op.cascade ? ' CASCADE' : ''}`)
+      destructiveReasons.push(`drops type "${op.name}"${op.cascade ? ' and every column/object that depends on it (CASCADE)' : ''}`)
+      if (!op.cascade) notes.push('If the type is used by a column, PostgreSQL blocks the drop — re-run with CASCADE to force it.')
+      break
+    case 'createExtension': {
+      const parts = [`CREATE EXTENSION IF NOT EXISTS ${q(op.name)}`]
+      if (op.schema) parts.push(`SCHEMA ${q(op.schema)}`)
+      if (op.version) parts.push(`VERSION ${sqlString(op.version)}`)
+      statements.push(parts.join(' '))
+      notes.push('Some extensions require superuser privileges; the server will report an error if not permitted.')
+      break
+    }
+    case 'updateExtension':
+      statements.push(`ALTER EXTENSION ${q(op.name)} UPDATE${op.version ? ` TO ${sqlString(op.version)}` : ''}`)
+      break
+    case 'dropExtension':
+      statements.push(`DROP EXTENSION ${q(op.name)}${op.cascade ? ' CASCADE' : ''}`)
+      destructiveReasons.push(`drops extension "${op.name}"${op.cascade ? ' and every dependent object (CASCADE)' : ''}`)
+      if (!op.cascade) notes.push('If other objects depend on the extension, PostgreSQL blocks the drop — re-run with CASCADE to force it.')
       break
   }
 

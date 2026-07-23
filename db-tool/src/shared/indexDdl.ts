@@ -21,20 +21,36 @@ function qindex(engine: Engine, schema: string, name: string): string {
 
 function validate(spec: IndexCreateSpec): void {
   if (!spec.name.trim()) throw new Error('Index name is required.')
+  const hasExpr = !!(spec.expression && spec.expression.trim())
   const cols = spec.columns.filter((c) => c && c.trim())
-  if (cols.length === 0) throw new Error('Select at least one column.')
+  if (!hasExpr && cols.length === 0) throw new Error('Select at least one column (or enter an expression).')
 }
 
-/** CREATE [UNIQUE] INDEX name ON table (col1, col2, …). */
+/**
+ * CREATE [UNIQUE] INDEX name ON table [USING method] (cols | expression) [WHERE …].
+ * The method / expression / WHERE clauses are PostgreSQL-only (ignored on other
+ * engines); a plain multi-column B-tree index is unchanged from before.
+ */
 export function buildCreateIndex(engine: Engine, spec: IndexCreateSpec): DdlPreview {
   engine = sqlDialect(engine)
   validate(spec)
-  const cols = spec.columns.filter((c) => c && c.trim()).map((c) => q(engine, c)).join(', ')
+  const pg = engine === 'postgres'
   const unique = spec.unique ? 'UNIQUE ' : ''
+  const notes: string[] = []
+  // Key list: a PG expression (e.g. lower(email)) replaces the column list.
+  const hasExpr = pg && !!(spec.expression && spec.expression.trim())
+  const keyList = hasExpr
+    ? `(${spec.expression!.trim()})`
+    : `(${spec.columns.filter((c) => c && c.trim()).map((c) => q(engine, c)).join(', ')})`
+  const using = pg && spec.method && spec.method !== 'btree' ? ` USING ${spec.method}` : ''
+  const where = pg && spec.where && spec.where.trim() ? ` WHERE (${spec.where.trim()})` : ''
+  if (!pg && (spec.method || spec.expression || spec.where)) {
+    notes.push('Index method / expression / partial-WHERE are PostgreSQL-only and were ignored.')
+  }
   // The index NAME is always unqualified in CREATE INDEX (even in PG, where the
   // index is created in the table's schema); the TABLE is schema-qualified.
-  const sql = `CREATE ${unique}INDEX ${q(engine, spec.name)} ON ${qtable(engine, spec.schema, spec.table)} (${cols});`
-  return { sql, statements: [sql], destructive: false, destructiveReasons: [], notes: [] }
+  const sql = `CREATE ${unique}INDEX ${q(engine, spec.name)} ON ${qtable(engine, spec.schema, spec.table)}${using} ${keyList}${where};`
+  return { sql, statements: [sql], destructive: false, destructiveReasons: [], notes }
 }
 
 /** DROP INDEX (dialect-correct form). */
@@ -59,7 +75,10 @@ export function buildAlterIndex(engine: Engine, spec: IndexCreateSpec, original:
   const renamedOnly =
     spec.name !== (spec.originalName ?? original.name) &&
     spec.unique === original.unique &&
-    JSON.stringify(spec.columns.filter(Boolean)) === JSON.stringify(original.columns.filter(Boolean))
+    JSON.stringify(spec.columns.filter(Boolean)) === JSON.stringify(original.columns.filter(Boolean)) &&
+    (spec.method ?? 'btree') === (original.method ?? 'btree') &&
+    (spec.where ?? '') === (original.where ?? '') &&
+    (spec.expression ?? '') === (original.expression ?? '')
   const oldName = spec.originalName ?? original.name
 
   if (renamedOnly && engine !== 'sqlite') {

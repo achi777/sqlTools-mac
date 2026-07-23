@@ -1,4 +1,10 @@
-:root {
+/* ===== Theme tokens (TASK 69) ===========================================
+   The DARK palette is the app's current look and stays the default (used when
+   no data-theme is set, and for data-theme="dark"). The LIGHT palette is the
+   new alternative. The toggle sets data-theme on <html>; everything below reads
+   these variables so both themes stay consistent. */
+:root,
+:root[data-theme='dark'] {
   --bg: #1e1e2e;
   --bg-alt: #252537;
   --panel: #2a2a3c;
@@ -9,6 +15,62 @@
   --accent-2: #4caf8f;
   --danger: #e06c75;
   --ok: #98c379;
+  /* semantic extras (were hardcoded before) */
+  --on-accent: #12121c;        /* text on accent / ok / danger backgrounds */
+  --danger-text: #ff8a8a;      /* danger message/border text on a surface */
+  --danger-border: #c0504d;
+  --danger-tint: rgba(220, 80, 80, 0.16);
+  --warning: #d8be5a;          /* warning text */
+  --dot-off: #55596a;          /* disconnected connection dot */
+  --selected: #33334a;         /* selected row / active nav */
+  --hover: #30304a;            /* hover surface */
+  --scrollbar: #3a3a4f;
+  --scrollbar-hover: #55596a;
+  /* tree object icon accents */
+  --ic-table: #7fa7d8;
+  --ic-view: #6fbf8f;
+  --ic-fn: #c39bd8;
+  --ic-seq: #d0a35a;
+  --ic-trigger: #d8b24a;
+  --ic-index: #8a96b8;
+  --ic-pk: #d8be5a;
+  --ic-fk: #7fa7d8;
+  color-scheme: dark;
+}
+
+:root[data-theme='light'] {
+  --bg: #f6f7f9;
+  --bg-alt: #eceef2;
+  --panel: #ffffff;
+  --border: #d3d7df;
+  --text: #1f2330;
+  --text-dim: #63697b;
+  --accent: #3b6fe0;
+  --accent-2: #1f8a6d;
+  --danger: #cf3a2c;
+  --ok: #2f8a3e;
+  --on-accent: #ffffff;
+  --danger-text: #c0392b;
+  --danger-border: #cf3a2c;
+  --danger-tint: rgba(207, 58, 44, 0.12);
+  --warning: #9a6a00;
+  --dot-off: #b4b8c2;
+  --selected: #dfe6f7;
+  --hover: #eef1f8;
+  --scrollbar: #c8ccd6;
+  --scrollbar-hover: #a9aebc;
+  --ic-table: #2f6bb0;
+  --ic-view: #1f8a5a;
+  --ic-fn: #8a4fb0;
+  --ic-seq: #a06a1f;
+  --ic-trigger: #93780f;
+  --ic-index: #5a6485;
+  --ic-pk: #93780f;
+  --ic-fk: #2f6bb0;
+  color-scheme: light;
+}
+
+:root {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
 }
 
@@ -27,6 +89,23 @@ body {
   background: var(--bg);
   color: var(--text);
   font-size: 13px;
+}
+
+/* Themed scrollbars (both themes; color-scheme handles native form controls). */
+::-webkit-scrollbar {
+  width: 11px;
+  height: 11px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar);
+  border-radius: 6px;
+  border: 2px solid var(--bg-alt);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-hover);
 }
 
 .app {
@@ -174,6 +253,15 @@ body {
   color: var(--text-dim);
 }
 
+/* Transient hint posted when a native-menu item has no context to act on (TASK 72). */
+.menu-notice {
+  color: var(--text);
+  background: var(--accent-soft, rgba(90, 130, 245, 0.16));
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 8px;
+}
+
 button {
   background: var(--panel);
   color: var(--text);
@@ -190,7 +278,7 @@ button:hover {
 
 button.primary {
   background: var(--accent);
-  color: #12121c;
+  color: var(--on-accent);
   border-color: var(--accent);
   font-weight: 600;
 }
@@ -307,7 +395,7 @@ label {
 }
 .badge.dot-ok {
   background: var(--ok);
-  color: #12121c;
+  color: var(--on-accent);
 }
 
 /* connection state dot + engine icon (in the Connections list) */
@@ -324,7 +412,7 @@ label {
   box-shadow: 0 0 5px rgba(87, 201, 138, 0.7);
 }
 .conn-state.off {
-  background: #55596a;
+  background: var(--dot-off);
 }
 .conn-engine-icon {
   flex: none;
@@ -397,26 +485,26 @@ label {
   opacity: 1;
 }
 .obj-icon.table {
-  color: #7fa7d8;
+  color: var(--ic-table);
 }
 .obj-icon.view {
-  color: #6fbf8f;
+  color: var(--ic-view);
 }
 .obj-icon.fn {
-  color: #c39bd8;
+  color: var(--ic-fn);
 }
 .obj-icon.proc {
-  color: #c39bd8;
+  color: var(--ic-fn);
 }
 .obj-icon.seq {
-  color: #d0a35a;
+  color: var(--ic-seq);
 }
 .obj-icon.trigger {
-  color: #d8b24a;
+  color: var(--ic-trigger);
 }
 .obj-icon.index,
 .obj-icon.index-u {
-  color: #8a96b8;
+  color: var(--ic-index);
 }
 .cat-icon {
   color: var(--text-dim);
@@ -549,7 +637,7 @@ label {
   font-size: 10px;
 }
 .cw-err {
-  color: #ff8a8a;
+  color: var(--danger-text);
   font-size: 11px;
 }
 
@@ -583,7 +671,7 @@ label {
 
 .pg-btn.active {
   background: var(--accent);
-  color: #12121c;
+  color: var(--on-accent);
   border-color: var(--accent);
   font-weight: 600;
 }
@@ -740,7 +828,7 @@ label {
 
 .fb-combiner button.active {
   background: var(--accent);
-  color: #12121c;
+  color: var(--on-accent);
   border-color: var(--accent);
   font-weight: 600;
 }
@@ -841,10 +929,10 @@ label {
   opacity: 0.55;
 }
 .tree-node.column .col-pk {
-  color: #d8be5a;
+  color: var(--ic-pk);
 }
 .tree-node.column .col-fk {
-  color: #7fa7d8;
+  color: var(--ic-table);
 }
 .tree-node.column.notnull .tree-label {
   font-weight: 600;
@@ -1030,17 +1118,17 @@ label {
 }
 .vb-dup-warn {
   font-size: 9px;
-  color: #ff8a8a;
-  background: rgba(220, 80, 80, 0.16);
+  color: var(--danger-text);
+  background: var(--danger-tint);
   border-radius: 3px;
   padding: 0 4px;
   text-transform: uppercase;
 }
 .vb-out-dup .vb-out-col {
-  color: #ff8a8a;
+  color: var(--danger-text);
 }
 .vb-alias-dup {
-  border-color: #c0504d !important;
+  border-color: var(--danger-border) !important;
 }
 
 /* React Flow table node */
@@ -1240,7 +1328,7 @@ label {
 
 .tab-close:hover {
   background: var(--danger);
-  color: #12121c;
+  color: var(--on-accent);
 }
 
 .tab-add {
@@ -1516,7 +1604,7 @@ label {
 
 .context-item:hover {
   background: var(--accent);
-  color: #12121c;
+  color: var(--on-accent);
 }
 
 .context-divider {
@@ -1535,7 +1623,7 @@ label {
 }
 .context-item.danger:hover {
   background: var(--danger);
-  color: #12121c;
+  color: var(--on-accent);
 }
 
 /* --- modal --- */
@@ -1569,7 +1657,7 @@ label {
 
 .danger-btn {
   background: var(--danger);
-  color: #12121c;
+  color: var(--on-accent);
   border-color: var(--danger);
   font-weight: 600;
 }
@@ -2032,6 +2120,17 @@ label {
 .idx-add {
   margin-top: 8px;
 }
+.idx-pg-adv {
+  margin-top: 12px;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+.idx-expr {
+  width: 100%;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
 .idx-preview {
   flex: 1;
   min-width: 0;
@@ -2135,6 +2234,24 @@ label {
   font-size: 11px;
   max-height: 80px;
   overflow: auto;
+}
+
+/* Data Transfer wizard */
+.io-warn {
+  color: var(--warning);
+  font-size: 11px;
+}
+.io-notes {
+  padding-left: 16px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.io-type {
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+}
+.io-transfer tr.io-review td {
+  background: rgba(184, 134, 11, 0.12);
 }
 
 /* Read-only "Filter SQL" bottom panel (table browse only) */
@@ -2296,6 +2413,60 @@ label {
   margin-top: 4px;
 }
 
+/* --- Saved filters popover (TASK 70) --- */
+.sf-popover {
+  width: 320px;
+}
+.sf-save-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.sf-save-row input {
+  flex: 1;
+}
+.sf-list {
+  max-height: 220px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.sf-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 4px;
+  border-radius: 5px;
+}
+.sf-item:hover {
+  background: var(--hover);
+}
+.sf-name {
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sf-name:hover {
+  color: var(--accent);
+}
+.sf-rename {
+  flex: 1;
+}
+.sf-confirm {
+  font-size: 11px;
+  color: var(--danger-text);
+}
+.sf-msg {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
 /* --- About: status-bar entry point + modal --- */
 .about-btn {
   display: inline-flex;
@@ -2315,6 +2486,65 @@ label {
 
 .about-modal {
   width: 380px;
+}
+
+/* --- Keyboard shortcuts reference (TASK 71) --- */
+.sc-modal {
+  width: 460px;
+}
+.sc-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.sc-group-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 2px;
+}
+.sc-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+}
+.sc-label {
+  flex: 1;
+  min-width: 0;
+}
+.sc-keys {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+.sc-or {
+  color: var(--text-dim);
+  font-size: 10px;
+  margin: 0 2px;
+}
+.sc-modal kbd {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  color: var(--text);
+  margin-left: 2px;
+}
+.sc-modal kbd:first-child {
+  margin-left: 0;
+}
+.sc-note {
+  margin-top: 12px;
+  font-size: 11px;
+  color: var(--text-dim);
 }
 .about-head {
   display: flex;

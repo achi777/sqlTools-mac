@@ -15,6 +15,9 @@ import type {
   HistoryEntry,
   IndexCreateSpec,
   IndexInfo,
+  MatViewRef,
+  TypeRef,
+  ExtensionRef,
   ObjectOp,
   PersistedTab,
   QueryResult,
@@ -22,6 +25,8 @@ import type {
   RoutineKind,
   PackageRef,
   SafeConnectionConfig,
+  SavedFilter,
+  SavedFilterState,
   SchemaCatalog,
   SequenceInfo,
   SequenceRef,
@@ -29,6 +34,7 @@ import type {
   SortSpec,
   TableRef,
   TableSpec,
+  ThemeMode,
   TriggerRef,
   TriggerSpec,
   ViewModel,
@@ -88,6 +94,23 @@ export interface IoRestoreCtx {
   schema: string
 }
 
+/** State for the PostgreSQL Extensions dialog (installed + available list). */
+export interface ExtDialogState {
+  connectionId: string
+  installed: ExtensionRef[]
+  available: ExtensionRef[]
+  loading: boolean
+  message: string | null
+}
+
+/** Context for the cross-engine Data Transfer wizard (pre-selected source). */
+export interface IoTransferCtx {
+  connectionId: string
+  schema: string
+  /** Optional table to pre-select in the source list. */
+  table?: string
+}
+
 export type TreeTarget =
   | { kind: 'connection'; connectionId: string }
   | { kind: 'schema'; connectionId: string; schema: string }
@@ -100,6 +123,11 @@ export type TreeTarget =
   | { kind: 'trigger'; connectionId: string; schema: string; table: string; name: string; enabled?: boolean }
   | { kind: 'indexesCat'; connectionId: string; schema: string; table: string }
   | { kind: 'index'; connectionId: string; schema: string; table: string; name: string; constraintBacked: boolean }
+  // PostgreSQL advanced objects (TASK 67)
+  | { kind: 'matview'; connectionId: string; schema: string; name: string; populated: boolean }
+  | { kind: 'type'; connectionId: string; schema: string; name: string; typeKind: 'enum' | 'composite' | 'other' }
+  | { kind: 'extensionsCat'; connectionId: string; schema: string }
+  | { kind: 'extension'; connectionId: string; name: string; installedVersion: string | null; defaultVersion: string | null }
 
 export interface ContextMenuState {
   x: number
@@ -129,7 +157,7 @@ export interface GridPending {
 export interface ObjectEditorState {
   // Oracle adds packages: 'package' (new — spec + body in one editor, split on
   // the `/` line), and 'packageSpec' / 'packageBody' (edit one part).
-  objKind: 'view' | RoutineKind | 'package' | 'packageSpec' | 'packageBody'
+  objKind: 'view' | 'matview' | 'type' | RoutineKind | 'package' | 'packageSpec' | 'packageBody'
   mode: 'new' | 'edit'
   schema: string
   /** View: editable target name. Routine/package: original name for display/drop. */
@@ -242,6 +270,10 @@ interface TreeState {
   /** Oracle PL/SQL packages per schema. */
   packagesBySchema: Record<string, PackageRef[]>
   sequencesBySchema: Record<string, SequenceRef[]>
+  /** PostgreSQL advanced objects (TASK 67), per schema. Extensions are DB-wide but keyed by schema for tree layout. */
+  matviewsBySchema: Record<string, MatViewRef[]>
+  typesBySchema: Record<string, TypeRef[]>
+  extensionsBySchema: Record<string, ExtensionRef[]>
   /** Tables whose child nodes (Columns/Triggers/Indexes) are expanded — keys `${schema}::${table}`. */
   expandedTables: string[]
   /** Triggers per table — keys `${schema}::${table}`. */
@@ -274,6 +306,9 @@ function emptyTree(): TreeState {
     proceduresBySchema: {},
     packagesBySchema: {},
     sequencesBySchema: {},
+    matviewsBySchema: {},
+    typesBySchema: {},
+    extensionsBySchema: {},
     expandedTables: [],
     triggersByTable: {},
     indexesByTable: {},
@@ -287,7 +322,12 @@ function tkey(schema: string, table: string): string {
   return `${schema}::${table}`
 }
 
-export type ObjCategory = 'tables' | 'views' | 'functions' | 'procedures' | 'packages' | 'sequences'
+/** Apply the color theme by setting data-theme on the document root. */
+function applyTheme(theme: ThemeMode): void {
+  document.documentElement.setAttribute('data-theme', theme)
+}
+
+export type ObjCategory = 'tables' | 'views' | 'functions' | 'procedures' | 'packages' | 'sequences' | 'matviews' | 'types' | 'extensions'
 
 interface AppState {
   // Connections (shared across tabs)
@@ -317,10 +357,25 @@ interface AppState {
   ioImport: IoImportCtx | null
   ioDbDump: IoDbDumpCtx | null
   ioRestore: IoRestoreCtx | null
+  ioTransfer: IoTransferCtx | null
+  /** PostgreSQL Extensions manager dialog (TASK 67). */
+  extDialog: ExtDialogState | null
 
   // Layout
   sidebarCollapsed: boolean
   filterSqlCollapsed: boolean
+  theme: ThemeMode
+  /** Keyboard-shortcuts reference modal (TASK 71). */
+  shortcutsOpen: boolean
+  // Native menu wiring (TASK 72)
+  /** About dialog open (shared so the menu + the status-bar button both drive it). */
+  aboutOpen: boolean
+  /** Bumped to ask the ConnectionManager to open its New-connection form. */
+  newConnSignal: number
+  /** Bumped to ask the active table's DataGrid to open its Saved-filters popover. */
+  savedFiltersSignal: number
+  /** Transient status-bar notice (auto-clears) for menu no-ops etc. */
+  notice: string | null
 
   ready: boolean
 
@@ -332,11 +387,19 @@ interface AppState {
   connect: (id: string) => Promise<void>
   disconnect: (id: string) => Promise<void>
   useConnectionInActiveTab: (id: string) => Promise<void>
-  saveConnection: (c: ConnectionConfig) => Promise<SafeConnectionConfig | null>
+  saveConnection: (c: ConnectionConfig) => Promise<(SafeConnectionConfig & { warning?: string }) | null>
   deleteConnection: (id: string) => Promise<void>
 
   // --- tree ops
   loadSchemas: (connId: string) => Promise<void>
+  /**
+   * Cache-busting reload of a connection's object tree: re-reads the live schema
+   * list and re-fetches every currently-EXPANDED schema/category/table-child from
+   * the database, dropping stale cached lists (so a newly created table appears
+   * and a dropped one disappears without a reconnect). Scoped to `connId` and to
+   * what is expanded, so large schemas stay responsive.
+   */
+  refreshTree: (connId: string) => Promise<void>
   toggleSchema: (connId: string, schema: string) => Promise<void>
   openTable: (ref: TableRef) => Promise<void>
 
@@ -369,6 +432,14 @@ interface AppState {
   // --- filter mode (quick | builder | custom WHERE)
   setFilterMode: (mode: FilterMode) => Promise<void>
   setCustomWhere: (text: string) => Promise<void>
+  // --- saved filters (TASK 70)
+  /** Table key (engine::schema::table) for the active grid, or null. */
+  savedFilterKey: () => string | null
+  /** The active tab's current filter state (for saving). */
+  captureCurrentFilter: () => SavedFilterState | null
+  /** Load the saved filter's state into the active tab and run it (page-1 reset);
+   *  drops any condition on a column that no longer exists and returns a warning. */
+  applySavedFilter: (state: SavedFilterState) => Promise<{ warning?: string }>
 
   // --- grid CRUD (staged pending changes)
   stageEdit: (primaryKey: Record<string, unknown>, column: string, value: unknown) => void
@@ -417,6 +488,18 @@ interface AppState {
   applyObjectEditor: (tabId: string) => Promise<void>
   openViewData: (connId: string, schema: string, name: string) => Promise<void>
 
+  // --- PostgreSQL advanced objects (TASK 67)
+  /** Materialized views: create (SQL editor) / edit (drop+recreate) / browse via openViewData. */
+  openNewMatView: (connId: string, schema: string) => void
+  openEditMatView: (connId: string, schema: string, name: string) => Promise<void>
+  /** Types/enums: create (SQL editor), and enum ALTER helpers pre-filled in the editor. */
+  openNewType: (connId: string, schema: string) => void
+  openTypeAlter: (connId: string, schema: string, name: string, kind: 'addValue' | 'rename') => void
+  /** Extensions dialog (list installed + available, install/update/drop). */
+  openExtensions: (connId: string) => void
+  closeExtensions: () => void
+  refreshExtensions: (connId: string) => Promise<void>
+
   // --- sequences (PostgreSQL)
   openNewSequence: (connId: string, schema: string) => void
   openEditSequence: (connId: string, schema: string, name: string) => Promise<void>
@@ -461,12 +544,29 @@ interface AppState {
   openImport: (connId: string, schema: string, table: string) => void
   openDbDump: (connId: string, schema: string) => void
   openRestore: (connId: string, schema: string) => void
+  /** Open the cross-engine Data Transfer wizard (optionally pre-select a table). */
+  openTransfer: (connId: string, schema: string, table?: string) => void
   closeIo: () => void
 
   // --- layout
   toggleSidebar: () => void
   setSidebarCollapsed: (collapsed: boolean) => void
   toggleFilterSql: () => void
+  /** Switch color theme (persisted + applied to <html data-theme>). */
+  setTheme: (theme: ThemeMode) => void
+  toggleTheme: () => void
+  // --- keyboard shortcuts (TASK 71)
+  setShortcutsOpen: (open: boolean) => void
+  /** Close the topmost open overlay (for Esc). Returns true if one was closed. */
+  closeTopOverlay: () => boolean
+  // --- native menu (TASK 72)
+  setAboutOpen: (open: boolean) => void
+  /** Ask the ConnectionManager to open its New-connection form. */
+  requestNewConnection: () => void
+  /** Ask the active table's DataGrid to open its Saved-filters popover. */
+  requestSavedFilters: () => void
+  /** Show a transient status-bar notice (auto-clears after a few seconds). */
+  setNotice: (msg: string | null) => void
   /** Open a SQL string in a NEW query tab (explicit "send to editor"). */
   openSqlInNewTab: (connId: string | null, sql: string) => void
 
@@ -568,6 +668,18 @@ export function buildObjectStatements(
     }
     const orReplace = oe.orReplace && engine !== 'sqlite' ? 'OR REPLACE ' : ''
     return { statements: [`CREATE ${orReplace}VIEW ${qn} AS\n${body}`], destructive: false }
+  }
+  if (oe.objKind === 'matview') {
+    // Materialized views have no CREATE OR REPLACE — an edit is DROP + CREATE.
+    const body = oe.body.trim()
+    if (oe.mode === 'edit') {
+      return { statements: [`DROP MATERIALIZED VIEW IF EXISTS ${qn}`, `CREATE MATERIALIZED VIEW ${qn} AS\n${body}`], destructive: true }
+    }
+    return { statements: [`CREATE MATERIALIZED VIEW ${qn} AS\n${body}`], destructive: false }
+  }
+  if (oe.objKind === 'type') {
+    // The editor holds the raw CREATE TYPE / ALTER TYPE SQL; run it verbatim.
+    return { statements: [oe.body], destructive: false }
   }
   // package (Oracle): the editor holds one or two CREATE OR REPLACE blocks
   // separated by a lone `/` line (the SQL*Plus block separator). Never split on
@@ -737,8 +849,16 @@ export const useStore = create<AppState>((set, get) => {
     ioImport: null,
     ioDbDump: null,
     ioRestore: null,
+    ioTransfer: null,
+    extDialog: null,
+    shortcutsOpen: false,
+    aboutOpen: false,
+    newConnSignal: 0,
+    savedFiltersSignal: 0,
+    notice: null,
     sidebarCollapsed: false,
     filterSqlCollapsed: false,
+    theme: 'dark',
     ready: false,
 
     getActiveTab: () => {
@@ -756,9 +876,12 @@ export const useStore = create<AppState>((set, get) => {
       await get().refreshConnections()
       try {
         const ui = await window.dbApi.loadUiState()
-        set({ sidebarCollapsed: !!ui.sidebarCollapsed, filterSqlCollapsed: !!ui.filterSqlCollapsed })
+        const theme: ThemeMode = ui.theme === 'light' ? 'light' : 'dark'
+        set({ sidebarCollapsed: !!ui.sidebarCollapsed, filterSqlCollapsed: !!ui.filterSqlCollapsed, theme })
+        applyTheme(theme)
       } catch {
         // non-critical UI preference
+        applyTheme('dark')
       }
       const persisted = await window.dbApi.loadTabs()
       let tabs: Tab[]
@@ -867,6 +990,100 @@ export const useStore = create<AppState>((set, get) => {
       const next: TreeState = { ...prev, schemas: res.data }
       set({ treeByConn: { ...get().treeByConn, [connId]: next } })
       if (res.data.length > 0) await get().toggleSchema(connId, res.data[0])
+    },
+
+    refreshTree: async (connId) => {
+      const schemasRes = await window.dbApi.listSchemas(connId)
+      if (!schemasRes.ok) return
+      const prev = get().treeByConn[connId] ?? emptyTree()
+      const schemas = schemasRes.data
+      const existing = new Set(schemas)
+      // Preserve the user's expansion, dropping any node whose schema disappeared.
+      const expanded = prev.expanded.filter((s) => existing.has(s))
+      const expandedCatsPrev = prev.expandedCats.filter((k) => existing.has(k.split('::')[0]))
+      const expandedTables = prev.expandedTables.filter((s) => existing.has(s.split('::')[0]))
+      // Cache-bust: start from empty per-schema/table maps and refill only the
+      // currently-expanded scope from the live database.
+      const next: TreeState = { ...emptyTree(), schemas, expanded, expandedCats: expandedCatsPrev, expandedTables, loadingKeys: [] }
+
+      const cats: ObjCategory[] = ['tables', 'views', 'functions', 'procedures', 'packages', 'sequences', 'matviews', 'types', 'extensions']
+      for (const schema of expanded) {
+        for (const cat of cats) {
+          if (!expandedCatsPrev.includes(`${schema}::${cat}`)) continue
+          if (cat === 'tables') {
+            const r = await window.dbApi.listTables(connId, schema)
+            if (r.ok) next.tablesBySchema[schema] = r.data
+          } else if (cat === 'views') {
+            const r = await window.dbApi.listViews(connId, schema)
+            if (r.ok) next.viewsBySchema[schema] = r.data
+          } else if (cat === 'functions' || cat === 'procedures') {
+            if (next.functionsBySchema[schema]) continue // one fetch covers both
+            const r = await window.dbApi.listRoutines(connId, schema)
+            if (r.ok) {
+              next.functionsBySchema[schema] = r.data.filter((x) => x.kind === 'function')
+              next.proceduresBySchema[schema] = r.data.filter((x) => x.kind === 'procedure')
+            }
+          } else if (cat === 'packages') {
+            const r = await window.dbApi.listPackages(connId, schema)
+            if (r.ok) next.packagesBySchema[schema] = r.data
+          } else if (cat === 'sequences') {
+            const r = await window.dbApi.listSequences(connId, schema)
+            if (r.ok && r.data.supported) next.sequencesBySchema[schema] = r.data.sequences
+          } else if (cat === 'matviews') {
+            const r = await window.dbApi.listMatViews(connId, schema)
+            if (r.ok && r.data.supported) next.matviewsBySchema[schema] = r.data.matviews
+          } else if (cat === 'types') {
+            const r = await window.dbApi.listTypes(connId, schema)
+            if (r.ok && r.data.supported) next.typesBySchema[schema] = r.data.types
+          } else if (cat === 'extensions') {
+            const r = await window.dbApi.listExtensions(connId)
+            if (r.ok && r.data.supported) next.extensionsBySchema[schema] = r.data.installed
+          }
+        }
+      }
+
+      // Re-fetch expanded table-children (columns/triggers/indexes); drop the
+      // expansion keys for tables that no longer exist.
+      const childKeys = expandedCatsPrev.filter((k) => /::(columns|triggers|indexes)$/.test(k))
+      const keptChild = new Set<string>()
+      for (const k of childKeys) {
+        const parts = k.split('::')
+        const kind = parts[parts.length - 1]
+        const table = parts[parts.length - 2]
+        const schema = parts.slice(0, parts.length - 2).join('::')
+        if (!next.tablesBySchema[schema]) {
+          const r = await window.dbApi.listTables(connId, schema)
+          if (r.ok) next.tablesBySchema[schema] = r.data
+        }
+        if (!(next.tablesBySchema[schema] ?? []).some((t) => t.name === table)) continue // table dropped
+        keptChild.add(k)
+        if (kind === 'columns') {
+          const r = await window.dbApi.getTableSpec(connId, schema, table)
+          if (r.ok) {
+            const fkCols = new Set<string>()
+            for (const fk of r.data.foreignKeys) for (const c of fk.columns) fkCols.add(c)
+            const pk = new Set(r.data.primaryKey)
+            next.columnsByTable[tkey(schema, table)] = r.data.columns.map((c) => ({
+              name: c.name,
+              type: c.type + (c.length != null ? `(${c.length}${c.scale != null ? ',' + c.scale : ''})` : ''),
+              isPrimaryKey: pk.has(c.name),
+              isForeignKey: fkCols.has(c.name),
+              nullable: c.nullable
+            }))
+          }
+        } else if (kind === 'triggers') {
+          const r = await window.dbApi.listTriggers(connId, schema, table)
+          if (r.ok) next.triggersByTable[tkey(schema, table)] = r.data
+        } else if (kind === 'indexes') {
+          const r = await window.dbApi.listIndexes(connId, schema, table)
+          if (r.ok) next.indexesByTable[tkey(schema, table)] = r.data
+        }
+      }
+      next.expandedCats = expandedCatsPrev.filter((k) => !/::(columns|triggers|indexes)$/.test(k) || keptChild.has(k))
+
+      set({ treeByConn: { ...get().treeByConn, [connId]: next } })
+      // Autocomplete reads the same live catalog — refresh it too.
+      await get().refreshCatalog(connId)
     },
 
     toggleSchema: async (connId, schema) => {
@@ -1050,6 +1267,61 @@ export const useStore = create<AppState>((set, get) => {
       if (!at?.gridTable) return
       updateTab(at.id, { customWhere: text, filterMode: 'custom', customWhereError: null })
       await get().reloadFiltered()
+    },
+
+    // --- saved filters (TASK 70) ---
+    savedFilterKey: () => {
+      const at = get().getActiveTab()
+      if (!at?.gridTable || !at.connectionId) return null
+      const engine = get().engineOf(at.connectionId) ?? 'unknown'
+      return `${engine}::${at.gridTable.schema}::${at.gridTable.table}`
+    },
+
+    captureCurrentFilter: () => {
+      const at = get().getActiveTab()
+      if (!at?.gridTable) return null
+      return {
+        filters: at.filters,
+        builderTree: at.builderTree,
+        filterMode: at.filterMode,
+        customWhere: at.customWhere
+      }
+    },
+
+    applySavedFilter: async (state) => {
+      const at = get().getActiveTab()
+      if (!at?.gridTable) return {}
+      // Current column set (for the missing-column guard). gridSpec first, else catalog.
+      const cols = new Set<string>()
+      for (const c of at.gridSpec?.columns ?? []) cols.add(c.name)
+      if (cols.size === 0) {
+        const cat = at.connectionId ? get().catalogByConn[at.connectionId] : undefined
+        const engine = get().engineOf(at.connectionId)
+        const t = cat?.tables.find((x) => x.name === at.gridTable!.table && (engine === 'sqlite' || x.schema === at.gridTable!.schema))
+        for (const c of t?.columns ?? []) cols.add(c.name)
+      }
+      // Prune structured conditions referencing columns that no longer exist.
+      let dropped = 0
+      const validFilters = cols.size === 0 ? state.filters : state.filters.filter((f) => cols.has(f.column) || (dropped++, false))
+      const pruneTree = (node: FilterGroup | null): FilterGroup | null => {
+        if (!node) return null
+        const children = node.children
+          .map((ch) => (ch.kind === 'group' ? pruneTree(ch) : cols.size === 0 || cols.has(ch.column) ? ch : (dropped++, null)))
+          .filter((ch): ch is NonNullable<typeof ch> => ch != null)
+        return { ...node, children }
+      }
+      const validTree = pruneTree(state.builderTree)
+      updateTab(at.id, {
+        filters: validFilters,
+        builderTree: validTree,
+        filterMode: state.filterMode,
+        customWhere: state.customWhere,
+        customWhereError: null
+      })
+      await get().reloadFiltered()
+      return dropped > 0
+        ? { warning: `${dropped} condition${dropped > 1 ? 's' : ''} referenced a column that no longer exists and ${dropped > 1 ? 'were' : 'was'} skipped.` }
+        : {}
     },
 
     addTab: (connectionId) => {
@@ -1280,7 +1552,9 @@ export const useStore = create<AppState>((set, get) => {
     },
 
     refreshCatalog: async (connId) => {
-      const res = await window.dbApi.getSchemaCatalog(connId, false)
+      // force=true so MAIN re-reads the live catalog instead of returning its
+      // per-connection cache — otherwise autocomplete stays stale after DDL.
+      const res = await window.dbApi.getSchemaCatalog(connId, true)
       if (res.ok) set({ catalogByConn: { ...get().catalogByConn, [connId]: res.data } })
     },
 
@@ -1481,7 +1755,12 @@ export const useStore = create<AppState>((set, get) => {
         const t = get().treeByConn[cur.connectionId]
         if (lr.ok && t) set({ treeByConn: { ...get().treeByConn, [cur.connectionId]: { ...t, indexesByTable: { ...t.indexesByTable, [`${op.schema}::${op.table}`]: lr.data } } } })
       } else {
-        await get().loadSchemas(cur.connectionId)
+        // dropTable / truncate / rename / create-drop schema: cache-bust the tree
+        // so the change (e.g. a dropped table) is reflected without a reconnect.
+        // refreshTree also refreshes the autocomplete catalog.
+        await get().refreshTree(cur.connectionId)
+        set({ objectOp: null })
+        return
       }
       await get().refreshCatalog(cur.connectionId)
       set({ objectOp: null })
@@ -1526,6 +1805,15 @@ export const useStore = create<AppState>((set, get) => {
           if (res.ok && res.data.supported) {
             next = { ...next, sequencesBySchema: { ...next.sequencesBySchema, [schema]: res.data.sequences } }
           }
+        } else if (cat === 'matviews' && !next.matviewsBySchema[schema]) {
+          const res = await window.dbApi.listMatViews(connId, schema)
+          if (res.ok && res.data.supported) next = { ...next, matviewsBySchema: { ...next.matviewsBySchema, [schema]: res.data.matviews } }
+        } else if (cat === 'types' && !next.typesBySchema[schema]) {
+          const res = await window.dbApi.listTypes(connId, schema)
+          if (res.ok && res.data.supported) next = { ...next, typesBySchema: { ...next.typesBySchema, [schema]: res.data.types } }
+        } else if (cat === 'extensions' && !next.extensionsBySchema[schema]) {
+          const res = await window.dbApi.listExtensions(connId)
+          if (res.ok && res.data.supported) next = { ...next, extensionsBySchema: { ...next.extensionsBySchema, [schema]: res.data.installed } }
         }
       }
       set({ treeByConn: { ...get().treeByConn, [connId]: next } })
@@ -1637,10 +1925,22 @@ export const useStore = create<AppState>((set, get) => {
       // Refresh the relevant tree category + catalog.
       const connId = tab.connectionId
       const isPackage = oe.objKind === 'package' || oe.objKind === 'packageSpec' || oe.objKind === 'packageBody'
-      const cat: ObjCategory = oe.objKind === 'view' ? 'views' : isPackage ? 'packages' : oe.objKind === 'procedure' ? 'procedures' : 'functions'
+      const cat: ObjCategory =
+        oe.objKind === 'view' ? 'views'
+          : oe.objKind === 'matview' ? 'matviews'
+            : oe.objKind === 'type' ? 'types'
+              : isPackage ? 'packages'
+                : oe.objKind === 'procedure' ? 'procedures'
+                  : 'functions'
       const tree = get().treeByConn[connId]
       if (tree) {
-        if (cat === 'views') {
+        if (cat === 'matviews') {
+          const mr = await window.dbApi.listMatViews(connId, oe.schema)
+          if (mr.ok && mr.data.supported) { const t2 = get().treeByConn[connId]; set({ treeByConn: { ...get().treeByConn, [connId]: { ...t2, matviewsBySchema: { ...t2.matviewsBySchema, [oe.schema]: mr.data.matviews } } } }) }
+        } else if (cat === 'types') {
+          const tr = await window.dbApi.listTypes(connId, oe.schema)
+          if (tr.ok && tr.data.supported) { const t2 = get().treeByConn[connId]; set({ treeByConn: { ...get().treeByConn, [connId]: { ...t2, typesBySchema: { ...t2.typesBySchema, [oe.schema]: tr.data.types } } } }) }
+        } else if (cat === 'views') {
           const vr = await window.dbApi.listViews(connId, oe.schema)
           if (vr.ok) set({ treeByConn: { ...get().treeByConn, [connId]: { ...get().treeByConn[connId], viewsBySchema: { ...get().treeByConn[connId].viewsBySchema, [oe.schema]: vr.data } } } })
         } else if (cat === 'packages') {
@@ -1666,6 +1966,79 @@ export const useStore = create<AppState>((set, get) => {
     openViewData: async (connId, schema, name) => {
       get().addTab(connId)
       await get().openTable({ schema, name, type: 'view' })
+    },
+
+    // --- PostgreSQL advanced objects (TASK 67) ---
+    openNewMatView: (connId, schema) => {
+      const tab: Tab = {
+        ...freshTab(connId, 'New materialized view', ''),
+        kind: 'object',
+        objectEditor: {
+          objKind: 'matview', mode: 'new', schema, name: 'new_matview', signature: null,
+          body: 'SELECT *\nFROM customers', orReplace: false, applying: false, message: null, confirmed: false
+        }
+      }
+      set({ tabs: [...get().tabs, tab], activeTabId: tab.id, contextMenu: null })
+    },
+
+    openEditMatView: async (connId, schema, name) => {
+      const res = await window.dbApi.getObjectDefinition({ connectionId: connId, kind: 'matview', schema, name })
+      const body = res.ok ? res.data : '-- failed to load materialized view definition'
+      const tab: Tab = {
+        ...freshTab(connId, `Matview: ${name}`, ''),
+        kind: 'object',
+        objectEditor: { objKind: 'matview', mode: 'edit', schema, name, signature: null, body, orReplace: false, applying: false, message: null, confirmed: false }
+      }
+      set({ tabs: [...get().tabs, tab], activeTabId: tab.id, contextMenu: null })
+    },
+
+    openNewType: (connId, schema) => {
+      const qn = qnameT('postgres', schema, 'new_type')
+      const body =
+        `-- Enum type:\nCREATE TYPE ${qn} AS ENUM ('first', 'second', 'third');\n\n` +
+        `-- …or a composite type (delete the enum above and use this instead):\n-- CREATE TYPE ${qn} AS (field1 text, field2 integer);`
+      const tab: Tab = {
+        ...freshTab(connId, 'New type', ''),
+        kind: 'object',
+        objectEditor: { objKind: 'type', mode: 'new', schema, name: 'new_type', signature: null, body, orReplace: false, applying: false, message: null, confirmed: false }
+      }
+      set({ tabs: [...get().tabs, tab], activeTabId: tab.id, contextMenu: null })
+    },
+
+    openTypeAlter: (connId, schema, name, kind) => {
+      const qn = qnameT('postgres', schema, name)
+      const body =
+        kind === 'addValue'
+          ? `-- Add an enum value. Optionally place it BEFORE/AFTER an existing one.\n` +
+            `ALTER TYPE ${qn} ADD VALUE 'new_value';\n` +
+            `-- e.g. ALTER TYPE ${qn} ADD VALUE 'x' AFTER 'first';\n` +
+            `-- NOTE: PostgreSQL cannot DROP or reorder enum values; renaming a value\n` +
+            `--       is ALTER TYPE ${qn} RENAME VALUE 'old' TO 'new'; (PG 10+).`
+          : `-- Rename the type, or (enum only) rename one of its values.\n` +
+            `ALTER TYPE ${qn} RENAME TO new_name;\n` +
+            `-- e.g. ALTER TYPE ${qn} RENAME VALUE 'first' TO 'primary';`
+      const tab: Tab = {
+        ...freshTab(connId, `Alter type: ${name}`, ''),
+        kind: 'object',
+        objectEditor: { objKind: 'type', mode: 'new', schema, name, signature: null, body, orReplace: false, applying: false, message: null, confirmed: false }
+      }
+      set({ tabs: [...get().tabs, tab], activeTabId: tab.id, contextMenu: null })
+    },
+
+    openExtensions: (connId) => {
+      set({ extDialog: { connectionId: connId, installed: [], available: [], loading: true, message: null }, contextMenu: null })
+      void get().refreshExtensions(connId)
+    },
+    closeExtensions: () => set({ extDialog: null }),
+    refreshExtensions: async (connId) => {
+      const res = await window.dbApi.listExtensions(connId)
+      const cur = get().extDialog
+      if (!cur || cur.connectionId !== connId) return
+      if (!res.ok || !res.data.supported) {
+        set({ extDialog: { ...cur, loading: false, message: res.ok ? (res.data.note ?? 'Not supported') : res.error } })
+        return
+      }
+      set({ extDialog: { ...cur, loading: false, installed: res.data.installed, available: res.data.available, message: null } })
     },
 
     // --- sequences (PostgreSQL) ---
@@ -1949,7 +2322,7 @@ export const useStore = create<AppState>((set, get) => {
         kind: 'index',
         indexEditor: {
           mode: 'new',
-          spec: { schema, table, name: `_idx_${table}`, originalName: null, columns: [], unique: false },
+          spec: { schema, table, name: `_idx_${table}`, originalName: null, columns: [], unique: false, method: 'btree', where: '', expression: '' },
           original: null,
           applying: false,
           message: null
@@ -1961,13 +2334,20 @@ export const useStore = create<AppState>((set, get) => {
     openEditIndex: (connId, schema, table, name) => {
       const tree = get().treeByConn[connId]
       const info = tree?.indexesByTable[tkey(schema, table)]?.find((i) => i.name === name)
+      // Round-trip PG method/predicate/expression. An expression index (whose key
+      // isn't a plain column list) is edited as an expression, not columns.
+      const method = (info?.method ?? 'btree') as IndexCreateSpec['method']
+      const isExprKey = !!info && info.columns.length === 1 && /[()\s]/.test(info.columns[0] ?? '')
       const spec: IndexCreateSpec = {
         schema,
         table,
         name,
         originalName: name,
-        columns: info ? [...info.columns] : [],
-        unique: info?.unique ?? false
+        columns: isExprKey ? [] : info ? [...info.columns] : [],
+        unique: info?.unique ?? false,
+        method,
+        where: info?.predicate ?? '',
+        expression: isExprKey ? (info?.keyExpr ?? '') : ''
       }
       const tab: Tab = {
         ...freshTab(connId, `Index: ${name}`, ''),
@@ -2067,18 +2447,42 @@ export const useStore = create<AppState>((set, get) => {
     openImport: (connId, schema, table) => set({ ioImport: { connectionId: connId, schema, table }, contextMenu: null }),
     openDbDump: (connId, schema) => set({ ioDbDump: { connectionId: connId, schema }, contextMenu: null }),
     openRestore: (connId, schema) => set({ ioRestore: { connectionId: connId, schema }, contextMenu: null }),
-    closeIo: () => set({ ioExport: null, ioImport: null, ioDbDump: null, ioRestore: null }),
+    openTransfer: (connId, schema, table) => set({ ioTransfer: { connectionId: connId, schema, table }, contextMenu: null }),
+    closeIo: () => set({ ioExport: null, ioImport: null, ioDbDump: null, ioRestore: null, ioTransfer: null }),
 
     // --- layout ---
     setSidebarCollapsed: (collapsed) => {
       set({ sidebarCollapsed: collapsed })
-      void window.dbApi.saveUiState({ sidebarCollapsed: collapsed, filterSqlCollapsed: get().filterSqlCollapsed })
+      void window.dbApi.saveUiState({ sidebarCollapsed: collapsed, filterSqlCollapsed: get().filterSqlCollapsed, theme: get().theme })
     },
     toggleSidebar: () => get().setSidebarCollapsed(!get().sidebarCollapsed),
     toggleFilterSql: () => {
       const filterSqlCollapsed = !get().filterSqlCollapsed
       set({ filterSqlCollapsed })
-      void window.dbApi.saveUiState({ sidebarCollapsed: get().sidebarCollapsed, filterSqlCollapsed })
+      void window.dbApi.saveUiState({ sidebarCollapsed: get().sidebarCollapsed, filterSqlCollapsed, theme: get().theme })
+    },
+    setTheme: (theme) => {
+      set({ theme })
+      applyTheme(theme)
+      void window.dbApi.saveUiState({ sidebarCollapsed: get().sidebarCollapsed, filterSqlCollapsed: get().filterSqlCollapsed, theme })
+      // Keep the native View ▸ Theme checkmark in sync (TASK 72).
+      window.dbApi.notifyThemeChanged(theme)
+    },
+    toggleTheme: () => get().setTheme(get().theme === 'dark' ? 'light' : 'dark'),
+    setShortcutsOpen: (open) => set({ shortcutsOpen: open }),
+    setAboutOpen: (open) => set({ aboutOpen: open }),
+    requestNewConnection: () => set({ newConnSignal: get().newConnSignal + 1 }),
+    requestSavedFilters: () => set({ savedFiltersSignal: get().savedFiltersSignal + 1 }),
+    setNotice: (msg) => set({ notice: msg }),
+    closeTopOverlay: () => {
+      const s = get()
+      if (s.aboutOpen) { set({ aboutOpen: false }); return true }
+      if (s.shortcutsOpen) { set({ shortcutsOpen: false }); return true }
+      if (s.extDialog) { s.closeExtensions(); return true }
+      if (s.objectOp) { s.closeObjectOp(); return true }
+      if (s.ioTransfer || s.ioExport || s.ioImport || s.ioDbDump || s.ioRestore) { s.closeIo(); return true }
+      if (s.contextMenu) { s.closeContextMenu(); return true }
+      return false
     },
     openSqlInNewTab: (connId, sql) => {
       get().addTab(connId ?? undefined)

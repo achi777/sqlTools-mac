@@ -18,8 +18,14 @@ import { ExportDialog } from './components/ExportDialog'
 import { ImportWizard } from './components/ImportWizard'
 import { DbDumpDialog } from './components/DbDumpDialog'
 import { RestoreDialog } from './components/RestoreDialog'
+import { TransferWizard } from './components/TransferWizard'
+import { ExtensionsDialog } from './components/ExtensionsDialog'
 import { AboutButton } from './components/AboutButton'
+import { ShortcutsModal } from './components/ShortcutsModal'
+import { Sun, Moon, Keyboard } from 'lucide-react'
 import { useStore } from './store'
+import { useShortcuts } from './useShortcuts'
+import { useMenuActions } from './useMenuActions'
 
 export default function App(): JSX.Element {
   const init = useStore((s) => s.init)
@@ -31,6 +37,9 @@ export default function App(): JSX.Element {
   useEffect(() => {
     void init()
   }, [init])
+
+  useShortcuts()
+  useMenuActions()
 
   const result = activeTab?.result ?? null
   const statusMessage = activeTab?.statusMessage ?? null
@@ -84,6 +93,9 @@ export default function App(): JSX.Element {
       <ImportWizard />
       <DbDumpDialog />
       <RestoreDialog />
+      <TransferWizard />
+      <ExtensionsDialog />
+      <ShortcutsModal />
       <div className="statusbar">
         <span>Connection: {activeName}</span>
         {!isDesigner && result && result.hasResultSet && (
@@ -92,9 +104,52 @@ export default function App(): JSX.Element {
           </span>
         )}
         <span className="spacer" />
+        <MenuNotice />
         {statusMessage && <span>{statusMessage}</span>}
+        <ShortcutsButton />
+        <ThemeToggle />
         <AboutButton />
       </div>
     </div>
+  )
+}
+
+/** Transient status-bar notice posted by native-menu no-ops (TASK 72). */
+function MenuNotice(): JSX.Element | null {
+  const notice = useStore((s) => s.notice)
+  const setNotice = useStore((s) => s.setNotice)
+  useEffect(() => {
+    if (!notice) return
+    const t = setTimeout(() => setNotice(null), 4000)
+    return () => clearTimeout(t)
+  }, [notice, setNotice])
+  if (!notice) return null
+  return <span className="menu-notice">{notice}</span>
+}
+
+/** Status-bar button that opens the keyboard-shortcuts reference (also F1). */
+function ShortcutsButton(): JSX.Element {
+  const setOpen = useStore((s) => s.setShortcutsOpen)
+  return (
+    <button className="about-btn" title="Keyboard shortcuts (F1)" aria-label="Keyboard shortcuts" onClick={() => setOpen(true)}>
+      <Keyboard size={14} />
+    </button>
+  )
+}
+
+/** Sun/Moon status-bar button to switch between light and dark themes. */
+function ThemeToggle(): JSX.Element {
+  const theme = useStore((s) => s.theme)
+  const toggleTheme = useStore((s) => s.toggleTheme)
+  const dark = theme === 'dark'
+  return (
+    <button
+      className="about-btn"
+      title={dark ? 'Switch to light theme' : 'Switch to dark theme'}
+      aria-label="Toggle theme"
+      onClick={toggleTheme}
+    >
+      {dark ? <Sun size={14} /> : <Moon size={14} />}
+    </button>
   )
 }

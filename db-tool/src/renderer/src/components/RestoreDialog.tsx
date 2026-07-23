@@ -10,8 +10,7 @@ export function RestoreDialog(): JSX.Element | null {
   const close = useStore((s) => s.closeIo)
   const connections = useStore((s) => s.connections)
   const defaults = useStore((s) => s.defaults)
-  const refreshCatalog = useStore((s) => s.refreshCatalog)
-  const loadSchemas = useStore((s) => s.loadSchemas)
+  const refreshTree = useStore((s) => s.refreshTree)
 
   const [filePath, setFilePath] = useState<string | null>(null)
   const [preview, setPreview] = useState<SqlFilePreview | null>(null)
@@ -56,9 +55,8 @@ export function RestoreDialog(): JSX.Element | null {
       return
     }
     setResult(res.data)
-    // Structure/data may have changed — refresh tree + catalog.
-    void loadSchemas(ctx.connectionId)
-    void refreshCatalog(ctx.connectionId)
+    // Structure/data may have changed — cache-bust the tree + autocomplete.
+    void refreshTree(ctx.connectionId)
   }
 
   const canRun = !!filePath && !!preview?.ok && confirmed && !running

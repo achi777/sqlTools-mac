@@ -54,6 +54,46 @@ function qid(id: string): string {
   return '"' + id.replace(/"/g, '""') + '"'
 }
 
+/** The first top-level parenthesised key list from a `pg_get_indexdef` string. */
+function extractIndexKeyList(def: string): string | null {
+  const usingAt = def.search(/\bUSING\b/i)
+  const from = usingAt >= 0 ? usingAt : 0
+  const open = def.indexOf('(', from)
+  if (open < 0) return null
+  let depth = 0
+  for (let i = open; i < def.length; i++) {
+    if (def[i] === '(') depth++
+    else if (def[i] === ')') {
+      depth--
+      if (depth === 0) return def.slice(open + 1, i).trim()
+    }
+  }
+  return null
+}
+
+/** Split a key list on commas that are NOT inside parentheses. */
+function splitTopLevelCommas(s: string): string[] {
+  const out: string[] = []
+  let depth = 0
+  let cur = ''
+  for (const ch of s) {
+    if (ch === '(') depth++
+    else if (ch === ')') depth--
+    if (ch === ',' && depth === 0) {
+      out.push(cur.trim())
+      cur = ''
+    } else cur += ch
+  }
+  if (cur.trim()) out.push(cur.trim())
+  return out
+}
+
+/** Strip surrounding double quotes from a plain quoted identifier ("Foo" → Foo). */
+function stripIdentQuotes(s: string): string {
+  const m = /^"((?:[^"]|"")*)"$/.exec(s)
+  return m ? m[1].replace(/""/g, '"') : s
+}
+
 export class PostgresDriver implements DbDriver {
   readonly config: ConnectionConfig
   private pool: pg.Pool | null = null
@@ -448,6 +488,44 @@ export class PostgresDriver implements DbDriver {
     }
   }
 
+  async transferInsert(
+    schema: string,
+    table: string,
+    columns: string[],
+    rows: unknown[][],
+    columnTypes: Record<string, string>,
+    _identityCols: string[]
+  ): Promise<number> {
+    if (rows.length === 0) return 0
+    const pool = this.ensure()
+    const client = await pool.connect()
+    const t = `${qid(schema)}.${qid(table)}`
+    const colList = columns.map(qid).join(', ')
+    // Keep parameter count well under Postgres' 65535 bind limit.
+    const perChunk = Math.max(1, Math.floor(60000 / columns.length))
+    try {
+      await client.query('BEGIN')
+      for (let i = 0; i < rows.length; i += perChunk) {
+        const chunk = rows.slice(i, i + perChunk)
+        const params: unknown[] = []
+        const tuples = chunk.map(
+          (row) =>
+            '(' +
+            row.map((v, c) => { params.push(coerceForWrite(v, columnTypes[columns[c]])); return `$${params.length}` }).join(', ') +
+            ')'
+        )
+        await client.query(`INSERT INTO ${t} (${colList}) VALUES ${tuples.join(', ')}`, params)
+      }
+      await client.query('COMMIT')
+      return rows.length
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => undefined)
+      throw err
+    } finally {
+      client.release()
+    }
+  }
+
   applyObjectSql(statements: string[]): Promise<DdlApplyResult> {
     return this.execStatements(statements)
   }
@@ -548,41 +626,111 @@ export class PostgresDriver implements DbDriver {
   }
 
   async listIndexes(schema: string, table: string): Promise<IndexInfo[]> {
+    // One row per index (not per column): parse the key list from pg_get_indexdef
+    // so EXPRESSION indexes (whose indkey is 0) are not dropped, and read the
+    // access method + partial predicate for the advanced-index editor.
     const res = await this.ensure().query(
       `SELECT i.relname AS name, ix.indisunique AS is_unique, ix.indisprimary AS is_primary,
+              am.amname AS method,
+              pg_get_expr(ix.indpred, ix.indrelid) AS predicate,
+              pg_get_indexdef(ix.indexrelid) AS def,
               EXISTS (
                 SELECT 1 FROM pg_constraint con
                 WHERE con.conindid = ix.indexrelid AND con.conrelid = t.oid AND con.contype IN ('p', 'u')
-              ) AS con_backed,
-              a.attname AS column_name, k.n AS ord
+              ) AS con_backed
        FROM pg_index ix
        JOIN pg_class i ON i.oid = ix.indexrelid
        JOIN pg_class t ON t.oid = ix.indrelid
        JOIN pg_namespace n ON n.oid = t.relnamespace
-       JOIN LATERAL generate_subscripts(ix.indkey, 1) AS k(n) ON true
-       JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ix.indkey[k.n]
+       JOIN pg_am am ON am.oid = i.relam
        WHERE n.nspname = $1 AND t.relname = $2
-       ORDER BY i.relname, k.n`,
+       ORDER BY i.relname`,
       [schema, table]
     )
-    const map = new Map<string, IndexInfo>()
+    return res.rows.map((r) => {
+      const def = String(r.def ?? '')
+      // The key list is the FIRST top-level parenthesised group after USING method.
+      const keyExpr = extractIndexKeyList(def)
+      const parts = keyExpr ? splitTopLevelCommas(keyExpr) : []
+      // A part is a plain column when it's a (optionally quoted) identifier with no
+      // parens/space modifiers — those prefill the column multi-select on edit.
+      const columns = parts.map((p) => stripIdentQuotes(p.trim()))
+      return {
+        schema,
+        table,
+        name: r.name as string,
+        columns,
+        unique: r.is_unique === true,
+        constraintBacked: r.is_primary === true || r.con_backed === true,
+        method: (r.method as string) ?? 'btree',
+        predicate: (r.predicate as string | null) ?? null,
+        keyExpr
+      } satisfies IndexInfo
+    })
+  }
+
+  async listMatViews(schema: string): Promise<import('@shared/types').MatViewRef[]> {
+    const res = await this.ensure().query(
+      `SELECT matviewname AS name, ispopulated AS populated
+       FROM pg_matviews WHERE schemaname = $1 ORDER BY lower(matviewname)`,
+      [schema]
+    )
+    return res.rows.map((r) => ({ schema, name: r.name as string, populated: r.populated === true }))
+  }
+
+  async listTypes(schema: string): Promise<import('@shared/types').TypeRef[]> {
+    const pool = this.ensure()
+    // User-defined enum ('e') + composite ('c') types; exclude table row-types
+    // (a composite has typrelid pointing at a relkind='c' pg_class, or 0 for enums).
+    const res = await pool.query(
+      `SELECT t.typname AS name, t.typtype AS kind, t.oid,
+              (SELECT string_agg(e.enumlabel, E'\\n' ORDER BY e.enumsortorder)
+                 FROM pg_enum e WHERE e.enumtypid = t.oid) AS labels
+       FROM pg_type t
+       JOIN pg_namespace n ON n.oid = t.typnamespace
+       WHERE n.nspname = $1 AND t.typtype IN ('e', 'c')
+         AND (t.typrelid = 0 OR EXISTS (SELECT 1 FROM pg_class c WHERE c.oid = t.typrelid AND c.relkind = 'c'))
+       ORDER BY t.typname`,
+      [schema]
+    )
+    const out: import('@shared/types').TypeRef[] = []
     for (const r of res.rows) {
-      const name = r.name as string
-      let idx = map.get(name)
-      if (!idx) {
-        idx = {
-          schema,
-          table,
-          name,
-          columns: [],
-          unique: r.is_unique === true,
-          constraintBacked: r.is_primary === true || r.con_backed === true
-        }
-        map.set(name, idx)
+      const kind = r.kind === 'e' ? 'enum' : r.kind === 'c' ? 'composite' : 'other'
+      let fields: { name: string; type: string }[] | undefined
+      if (kind === 'composite') {
+        const fr = await pool.query(
+          `SELECT a.attname AS name, format_type(a.atttypid, a.atttypmod) AS type
+           FROM pg_type t JOIN pg_class c ON c.oid = t.typrelid
+           JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+           WHERE t.oid = $1 ORDER BY a.attnum`,
+          [r.oid]
+        )
+        fields = fr.rows.map((f) => ({ name: f.name as string, type: f.type as string }))
       }
-      idx.columns.push(r.column_name as string)
+      out.push({
+        schema,
+        name: r.name as string,
+        kind,
+        labels: kind === 'enum' && r.labels ? String(r.labels).split('\n') : undefined,
+        fields
+      })
     }
-    return Array.from(map.values())
+    return out
+  }
+
+  async listExtensions(): Promise<{ installed: import('@shared/types').ExtensionRef[]; available: import('@shared/types').ExtensionRef[] }> {
+    const res = await this.ensure().query(
+      `SELECT a.name, a.default_version, a.installed_version, a.comment
+       FROM pg_available_extensions a ORDER BY a.name`
+    )
+    const map = (r: Record<string, unknown>): import('@shared/types').ExtensionRef => ({
+      name: r.name as string,
+      installedVersion: (r.installed_version as string | null) ?? null,
+      defaultVersion: (r.default_version as string | null) ?? null,
+      comment: (r.comment as string | null) ?? null
+    })
+    const all = res.rows.map(map)
+    return { installed: all.filter((e) => e.installedVersion != null), available: all }
   }
 
   async listViews(schema: string): Promise<ViewRef[]> {
@@ -614,7 +762,8 @@ export class PostgresDriver implements DbDriver {
 
   async getObjectDefinition(req: ObjectDefRequest): Promise<string> {
     const pool = this.ensure()
-    if (req.kind === 'view') {
+    // pg_get_viewdef returns the SELECT body for both views and materialized views.
+    if (req.kind === 'view' || req.kind === 'matview') {
       const res = await pool.query(`SELECT pg_get_viewdef(format('%I.%I', $1::text, $2::text)::regclass, true) AS def`, [
         req.schema,
         req.name

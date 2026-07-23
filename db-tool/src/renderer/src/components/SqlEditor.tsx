@@ -12,6 +12,7 @@ export function SqlEditor(): JSX.Element {
   const runActiveTab = useStore((s) => s.runActiveTab)
   const catalogByConn = useStore((s) => s.catalogByConn)
   const engineOf = useStore((s) => s.engineOf)
+  const theme = useStore((s) => s.theme)
 
   const connId = activeTab?.connectionId ?? null
   const catalog = connId ? catalogByConn[connId] ?? null : null
@@ -43,7 +44,7 @@ export function SqlEditor(): JSX.Element {
   return (
     <CodeMirror
       value={activeTab.sql}
-      theme="dark"
+      theme={theme}
       extensions={extensions}
       onChange={(v) => setTabSql(activeTab.id, v)}
       basicSetup={{ lineNumbers: true, foldGutter: false, autocompletion: true }}

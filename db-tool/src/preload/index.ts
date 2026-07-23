@@ -17,12 +17,18 @@ import {
   type ObjectOpRequest,
   type PersistedTabs,
   type RowChangeRequest,
+  type TransferPlanRequest,
+  type TransferRequest,
   type UpdateCellRequest
 } from '@shared/types'
 
 const api: DbApi = {
   listConnections: () => ipcRenderer.invoke(IPC.listConnections),
   saveConnection: (config: ConnectionConfig) => ipcRenderer.invoke(IPC.saveConnection, config),
+  secureStorageAvailable: () => ipcRenderer.invoke(IPC.secureStorageAvailable),
+  listSavedFilters: (key: string) => ipcRenderer.invoke(IPC.listSavedFilters, key),
+  saveSavedFilter: (key: string, filter: import('@shared/types').SavedFilter) => ipcRenderer.invoke(IPC.saveSavedFilter, key, filter),
+  deleteSavedFilter: (key: string, id: string) => ipcRenderer.invoke(IPC.deleteSavedFilter, key, id),
   deleteConnection: (id: string) => ipcRenderer.invoke(IPC.deleteConnection, id),
   getDefaults: () => ipcRenderer.invoke(IPC.getDefaults),
 
@@ -77,12 +83,17 @@ const api: DbApi = {
     ipcRenderer.invoke(IPC.getTriggerDetails, id, schema, table, name),
   listIndexes: (id: string, schema: string, table: string) =>
     ipcRenderer.invoke(IPC.listIndexes, id, schema, table),
+  listMatViews: (id: string, schema: string) => ipcRenderer.invoke(IPC.listMatViews, id, schema),
+  listTypes: (id: string, schema: string) => ipcRenderer.invoke(IPC.listTypes, id, schema),
+  listExtensions: (id: string) => ipcRenderer.invoke(IPC.listExtensions, id),
 
   exportData: (req: ExportRequest) => ipcRenderer.invoke(IPC.exportData, req),
   importPickFile: () => ipcRenderer.invoke(IPC.importPickFile),
   importPreview: (filePath: string, parse: ImportParseOptions, limit?: number) =>
     ipcRenderer.invoke(IPC.importPreview, filePath, parse, limit),
   importExecute: (req: ImportRequest) => ipcRenderer.invoke(IPC.importExecute, req),
+  transferPlan: (req: TransferPlanRequest) => ipcRenderer.invoke(IPC.transferPlan, req),
+  transferRun: (req: TransferRequest) => ipcRenderer.invoke(IPC.transferRun, req),
   onIoProgress: (cb: (p: IoProgress) => void) => {
     const listener = (_e: unknown, p: IoProgress): void => cb(p)
     ipcRenderer.on(IPC.ioProgress, listener)
@@ -102,7 +113,14 @@ const api: DbApi = {
     ipcRenderer.invoke(IPC.saveDiagramImage, dataUrl, suggestedName),
 
   getAppInfo: () => ipcRenderer.invoke(IPC.getAppInfo),
-  openExternal: (url: string) => ipcRenderer.invoke(IPC.openExternal, url)
+  openExternal: (url: string) => ipcRenderer.invoke(IPC.openExternal, url),
+
+  onMenuAction: (cb: (action: import('@shared/types').MenuAction) => void) => {
+    const listener = (_e: unknown, action: import('@shared/types').MenuAction): void => cb(action)
+    ipcRenderer.on(IPC.menuAction, listener)
+    return () => ipcRenderer.removeListener(IPC.menuAction, listener)
+  },
+  notifyThemeChanged: (theme: import('@shared/types').ThemeMode) => ipcRenderer.send(IPC.menuThemeChanged, theme)
 }
 
 if (process.contextIsolated) {

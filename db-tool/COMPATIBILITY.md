@@ -120,15 +120,28 @@ bare ISO string doesn't raise ORA-01858 on import. The exporter now reads the
 real types for **every** engine's `CREATE TABLE` (the old generic fallback was
 shared), so each dialect gets its own valid syntax.
 
+**Views & ER diagram (TASK 61):** Oracle **view create / edit / drop** work
+through the shared object editor — `CREATE OR REPLACE VIEW … AS SELECT` (which is
+dialect-neutral), the definition round-trips into the editor via `ALL_VIEWS.TEXT`
+(and views built with the Visual View Builder save with Oracle's no-`AS` table
+aliases). The **ER diagram** now renders Oracle FK relationships — `getTableSpec`
+introspects foreign keys from `ALL_CONSTRAINTS` (type `R`) resolved through
+`R_CONSTRAINT_NAME` to the parent table/columns — and supports **edit**: draw an
+FK (`ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY … REFERENCES …`, with
+`ON DELETE CASCADE`/`SET NULL` only — **Oracle has no `ON UPDATE`**, so the FK
+dialog never offers it), drop an FK, and create/edit/drop tables via the TASK 46
+designer. Dropping a table uses `DROP TABLE … CASCADE CONSTRAINTS PURGE`
+(drops referencing FKs and bypasses the recycle bin — noted in the confirm).
+
 Oracle dialect handling: identifiers are UPPERCASE (from `ALL_*` views, quoted
 as-is); binds are positional `:1, :2, …`; a **user == a schema**.
 
-**Staged for a later Oracle stage (not yet):** views create/edit, ER-diagram
-edit, and data-transfer type mapping for Oracle. Routine debugging, dependency
-analysis, overload disambiguation, and object/collection types are backlog.
-Compound / system / DDL-event triggers and
-trigger ordering (`FOLLOWS`) are also backlog. Those tree nodes/actions surface
-as empty or "later stage".
+**Backlog for Oracle:** materialized views (a distinct object type — not shown in
+the Views node), routine debugging, dependency analysis, overload disambiguation,
+object/collection types, standalone sequences beyond the current support, and
+compound / system / DDL-event triggers and trigger ordering (`FOLLOWS`). The
+**cross-engine data-transfer wizard** (table copy between any two engines with a
+type-translation matrix) is implemented in TASK 64 — see *Data Transfer* below.
 
 ## SQL Server (first-class engine)
 
@@ -283,6 +296,166 @@ version's live server. **PASS** = behaves identically to the reference version.
 4. **Sequences** are a PostgreSQL feature. On MySQL both versions correctly
    report "no standalone sequences" (empty list, no crash) — handled, not a
    failure.
+
+## Import / export & template audit (TASK 56)
+
+A systematic audit exercised, on **every** engine, an `_AUDIT_` table of
+deliberately awkward values — a quote (`O'Brien`), comma, newline, `%`, `_`,
+**Georgian unicode**, a decimal, a **date WITH a time component**, a boolean, a
+long text, an **empty string**, and a `NULL` — round-tripping through
+**CSV / JSON / Excel / SQL** export → import into a fresh target, plus the
+whole-database dump/restore, and created every routine/trigger/package from the
+**unmodified UI template**. All cells PASS:
+
+| Engine | CSV/JSON/Excel ⇆ | SQL export→exec | Dump/restore | fn | proc | trigger | package |
+| --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| PostgreSQL | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
+| MySQL | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
+| MariaDB | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
+| SQLite | ✅ | ✅ | ✅ | n/a | n/a | ✅ | — |
+| Oracle | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| SQL Server | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
+
+**Two real bugs were found by testing and fixed:**
+
+1. **Oracle date/time import → `ORA-01861`.** Importing a CSV/JSON/Excel row whose
+   value for a `DATE`/`TIMESTAMP` column is an ISO string (`2024-01-15T09:12:34Z`)
+   failed — node-oracledb can't implicitly parse that literal. The Oracle driver
+   now converts an ISO date string to a JS `Date` (which node-oracledb binds
+   natively) for `DATE`/`TIMESTAMP` columns. This also fixes **grid-editing** of
+   Oracle date columns. Oracle's `DATE` keeps its time component through the
+   round-trip.
+2. **MySQL/MariaDB `CALL procedure()` crashed the driver.** A `CALL` returns an
+   *array of result sets* (plus a trailing OK packet); `runQuery` mapped
+   `fields → f.name` over the nested/undefined field arrays and threw. It now
+   detects a multi-result-set response and uses the first result set (so running
+   a stored procedure returns its rows instead of crashing).
+
+**Documented semantic:** on **Oracle** an empty string `''` is stored as `NULL`
+(Oracle's rule) — so an imported/transferred `''` reads back as `NULL` there;
+every other engine preserves `''`. Oracle `DATE` always carries a time component.
+
+## Data Transfer — any engine → any engine (TASK 64)
+
+Tables can be **copied from any connection to any other**, across all six
+engines. The **source is READ-ONLY** — nothing is deleted or modified there; the
+selected tables are (re)created on the target with structure + data. Reachable
+from the tree via right-click → **Data Transfer…** on a schema (pick tables) or a
+table (pre-selected). The wizard shows a per-column **source type → target type**
+plan with lossy-mapping **warnings** before running, and offers per-column
+override / skip.
+
+**How it works:** structure is recreated by reusing the table-designer DDL
+generator (per-engine type rules), then tables are created **without foreign
+keys**, all data is copied via **parameterized** batched inserts, and FKs are
+added **last** (so integrity is validated once every row is present).
+Per-target INSERT mechanics: Oracle **single-row** binds; SQL Server **1000-row
+chunks wrapped in `SET IDENTITY_INSERT`** (batch, not `sp_executesql`, so it
+persists) to preserve source identity values; the rest **batched multi-row**.
+
+**Type-translation matrix — verified pairs (all PASS on real containers with
+disposable targets):**
+
+| ↓ from / → to | PostgreSQL | MySQL | MariaDB | SQLite | Oracle | SQL Server |
+| --- | :---: | :---: | :---: | :---: | :---: | :---: |
+| PostgreSQL | ✅ | — | — | — | ✅ | ✅ |
+| MySQL | — | — | — | — | ✅ | ✅ |
+| MariaDB | — | — | — | — | ✅ | ✅ |
+| SQLite | — | — | — | — | ✅ | ✅ |
+| Oracle | ✅ | ✅ | ✅ | ✅ | — | ✅ |
+| SQL Server | ✅ | ✅ | ✅ | ✅ | ✅ | — |
+
+Each pair copied an awkward-data table (auto-increment PK, `O'Brien`, **Georgian
+unicode**, empty string, `NULL`, decimal, **datetime with a time component**,
+boolean, long text) and verified row counts + values match, identity values are
+preserved, warnings appeared, and **the source was unchanged**. A two-table
+parent→child set (PG → SQL Server and PG → Oracle) verified **FK-ordered
+creation** with the FK recreated on the target.
+
+**Lossy / approximate mappings surfaced as warnings:**
+
+- **Auto-increment** translated `SERIAL ↔ AUTO_INCREMENT ↔ IDENTITY(1,1) ↔ Oracle
+  IDENTITY ↔ SQLite AUTOINCREMENT`; **source values are preserved** on copy.
+- **Booleans** map across `BOOLEAN / TINYINT / BIT / NUMBER(1)`; `''` → **`NULL`
+  on Oracle**; **Oracle `DATE`** → a timestamp/datetime type on other engines so
+  the **time component is kept**.
+- **`timestamptz`** → the offset is **preserved** on engines that have a
+  tz-aware type — SQL Server `DATETIMEOFFSET`, Oracle `TIMESTAMP WITH TIME ZONE`,
+  Postgres `timestamptz`; it is dropped (with a warning) only on **MySQL/SQLite**,
+  which have no tz type.
+- **PostgreSQL arrays** → flattened to text (values as JSON);
+  **JSON/JSONB** → `CLOB` (Oracle) / `NVARCHAR(MAX)` (SQL Server) / `TEXT`
+  (SQLite) where there is no native JSON; SQL Server **`NVARCHAR(MAX)`** →
+  `TEXT`/`CLOB`.
+- **BLOB / binary** columns round-trip as bytes (`bytea ↔ VARBINARY(MAX) ↔ BLOB`)
+  — the value is decoded back to binary rather than landing as a hex string.
+- An **unrecognized** source type is flagged in the plan for review (pick a
+  target type or skip the column) — never silently guessed.
+
+**Deep verification (TASK 65)** exercised, beyond the pair matrix, the real
+TransferWizard UI (both context-menu entry points, plan preview with visible
+per-column mapping + warnings, per-column skip/override honored on the target,
+existing-target modes) and these edge cases — all PASS: empty table (0 rows),
+composite PK, no PK, **self-referencing** and **cyclic** FKs, multi-table FK
+ordering, `DEFAULT`/`NOT NULL` columns, **large volume** (2,500 and 10,000 rows,
+crossing the SQL Server 1,000-row chunk boundary; Oracle single-row path),
+**100k-char** text → CLOB/`NVARCHAR(MAX)`, **BLOB** bytes, all-`NULL` rows,
+identifiers needing quoting (space / mixed-case / reserved word), **append**
+(existing rows kept, new added; a PK collision is reported, not silently
+partial), and a mid-transfer error (incompatible override → failure reported,
+target left in a defined empty state). Two bugs were found and fixed: binary
+values were transferred as a hex string (now decoded to bytes), and a NULL in a
+SQL Server binary column was mis-bound as `NVARCHAR` (now bound as `VarBinary`).
+
+**Existing target table** options: **Skip**, **Drop & recreate** (confirmed), or
+**Append**. A transfer refuses to run when source and target resolve to the same
+connection **and** schema (that would write the source) — copy to a different
+schema/connection instead.
+
+**Known limitations:** cross-engine **timestamps** move as strings and are
+subject to the usual timezone interpretation between engines (the time-of-day is
+preserved; on a plain (non-tz) timestamp the wall-clock hour may shift by the
+offset). Indexes are recreated best-effort (a name clash is reported, not fatal).
+A target sequence/identity counter is **not** advanced past the copied values
+(fine for a disposable/target copy; reset it if you then insert new rows without
+explicit ids). Very large BLOB values into **Oracle** bind as `RAW` and so are
+bounded by Oracle's bind size (small/medium binaries are fine).
+
+## PostgreSQL advanced objects (TASK 67)
+
+PostgreSQL connections show four PG-specific object areas in the tree (hidden for
+every other engine). Verified end-to-end against the live PG16 container with
+disposable `_pgadv_*` objects; seeds left intact (`customers=20`).
+
+- **Materialized Views** (`pg_matviews`) — a **Materialized Views** tree node
+  (separate from Views) showing each matview's populated/unpopulated status.
+  Create (SQL editor, `CREATE MATERIALIZED VIEW … AS <select>`), **Refresh data**
+  and **Refresh CONCURRENTLY** (needs a UNIQUE index — PostgreSQL errors otherwise,
+  which is surfaced), **Open data** (browses it like a table), Drop, and Edit
+  (matviews have **no `CREATE OR REPLACE`**, so an edit is DROP + CREATE, confirmed).
+- **Types / Enums** (`pg_type` / `pg_enum`) — a **Types** node listing enum +
+  composite types with their labels/fields. Create enum + composite (SQL editor),
+  `ALTER TYPE … ADD VALUE` (incl. `BEFORE`/`AFTER`), rename type / rename value
+  (pre-filled ALTER templates), and Drop (with a CASCADE choice; dropping an in-use
+  type is blocked by PG unless CASCADE). User-defined types also appear in the
+  **Table Designer's column-type dropdown** (a "User types" group), so an enum can
+  be picked as a column type. Invalid enum values are rejected by PostgreSQL and
+  the error is surfaced. **Limitation surfaced:** PostgreSQL cannot DROP or reorder
+  an enum value — the editor template states this.
+- **Extensions** (`pg_extension` / `pg_available_extensions`) — an **Extensions**
+  node listing installed extensions, and an **Extensions…** dialog listing all
+  available ones with Install / Update / Drop. `CREATE EXTENSION` / `ALTER EXTENSION
+  … UPDATE` / `DROP EXTENSION [CASCADE]`. **Caveat surfaced:** some extensions need
+  superuser — the server's error is shown rather than crashing.
+- **Advanced indexes** — the standalone index editor gains PG-only fields: an
+  index **method** (`btree`/`hash`/`gin`/`gist`/`brin`), a **partial** `WHERE`
+  predicate, and an **expression** index (e.g. `lower(email)`). The method,
+  predicate, and expression are read back from `pg_get_indexdef` + `pg_am` +
+  `pg_get_expr(indpred)` so they **round-trip** in the index list and edit form.
+  Basic B-tree / UNIQUE / multi-column indexes are unchanged; the other engines'
+  index flow is untouched (these fields are PostgreSQL-only). Note: a previous
+  bug where **expression indexes were dropped from the index list** (the column
+  join on `indkey=0` excluded them) is fixed — they now list correctly.
 
 ## Known engine limitations (informational)
 

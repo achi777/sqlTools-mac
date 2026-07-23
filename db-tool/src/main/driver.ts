@@ -158,6 +158,14 @@ export interface DbDriver {
   /** Indexes on a table (all engines), with unique + constraint-backed flags. */
   listIndexes(schema: string, table: string): Promise<IndexInfo[]>
 
+  // --- PostgreSQL advanced objects (TASK 67). Optional — only PG implements. ---
+  /** Materialized views in a schema. */
+  listMatViews?(schema: string): Promise<import('@shared/types').MatViewRef[]>
+  /** User-defined types (enum + composite) in a schema. */
+  listTypes?(schema: string): Promise<import('@shared/types').TypeRef[]>
+  /** Installed + available extensions (database-wide). */
+  listExtensions?(): Promise<{ installed: import('@shared/types').ExtensionRef[]; available: import('@shared/types').ExtensionRef[] }>
+
   /**
    * Apply a batch of INSERT/UPDATE/DELETE row changes in one transaction.
    * All values are parameterized. Returns per-phase counts and the inserted
@@ -172,6 +180,28 @@ export interface DbDriver {
    * statement failed on error.
    */
   execStatements(statements: string[]): Promise<DdlApplyResult>
+
+  /**
+   * Bulk-insert rows for a cross-engine data transfer, PRESERVING the explicit
+   * column values (including PK/identity) so foreign keys stay valid. Values are
+   * PARAMETERIZED — never string-concatenated. Per-engine mechanics:
+   *  - pg/mysql/sqlite: batched multi-row VALUES
+   *  - oracle: single-row binds (no multi-row VALUES)
+   *  - mssql: 1000-row chunks wrapped in SET IDENTITY_INSERT when `identityCols`
+   *    is non-empty (so server-side identity values are overridden by the source).
+   * Runs inside one transaction; returns the number of rows inserted. `columns`
+   * are target column names; each `rows[i]` is aligned to `columns`; `columnTypes`
+   * maps a target column name to its type (for the driver's own value coercion —
+   * ''→NULL, ISO-string→Date on Oracle, etc.).
+   */
+  transferInsert(
+    schema: string,
+    table: string,
+    columns: string[],
+    rows: unknown[][],
+    columnTypes: Record<string, string>,
+    identityCols: string[]
+  ): Promise<number>
 }
 
 // The factory is created lazily to avoid importing native drivers (which are

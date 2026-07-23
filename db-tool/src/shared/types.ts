@@ -33,7 +33,19 @@ export interface ConnectionConfig {
   host?: string
   port?: number
   user?: string
+  /**
+   * Plaintext password. In MAIN this is a TRANSIENT field only — a freshly typed
+   * secret on its way to being encrypted, or a decrypted secret on its way to a
+   * driver. It is NEVER persisted to disk and NEVER sent to the renderer.
+   */
   password?: string
+  /**
+   * The password encrypted with Electron `safeStorage` (OS keychain), base64.
+   * This is what is persisted on disk. MAIN-only; stripped before the renderer.
+   */
+  passwordEnc?: string
+  /** Renderer→main transient flag: on save, remove any stored secret. Never persisted. */
+  clearPassword?: boolean
   database?: string
   /** sqlite only: path to the .sqlite file */
   filePath?: string
@@ -53,8 +65,14 @@ export interface ConnectionConfig {
   instanceName?: string
 }
 
-/** Connection config with the secret stripped — safe to render/log. */
-export type SafeConnectionConfig = Omit<ConnectionConfig, 'password'>
+/**
+ * Connection config with ALL secrets stripped — safe to render/log. Carries only
+ * a boolean saying whether a secret is stored, so the edit form can show a masked
+ * "unchanged" placeholder without ever receiving the secret itself.
+ */
+export type SafeConnectionConfig = Omit<ConnectionConfig, 'password' | 'passwordEnc' | 'clearPassword'> & {
+  hasStoredPassword?: boolean
+}
 
 export interface TestConnectionResult {
   ok: boolean
@@ -224,12 +242,43 @@ export interface PersistedTabs {
   activeTabId: string | null
 }
 
+/** App color theme (manual toggle, persisted). Default 'dark' (the current look). */
+export type ThemeMode = 'dark' | 'light'
+
+/**
+ * Actions the native application menu (TASK 72) dispatches to the renderer. Each
+ * maps to an EXISTING store action — the menu never duplicates business logic.
+ */
+export type MenuAction =
+  | 'newConnection'
+  | 'newTab'
+  | 'closeTab'
+  | 'runQuery'
+  | 'refreshSchema'
+  | 'toggleSidebar'
+  | 'toggleFilterSql'
+  | 'toggleHistory'
+  | 'themeLight'
+  | 'themeDark'
+  | 'import'
+  | 'export'
+  | 'dump'
+  | 'restore'
+  | 'transfer'
+  | 'erDiagram'
+  | 'savedFilters'
+  | 'find'
+  | 'shortcuts'
+  | 'about'
+
 /** Persisted UI/layout preferences (userData ui.json). */
 export interface UiState {
   /** Left sidebar collapsed to the icon rail. */
   sidebarCollapsed: boolean
   /** Read-only filter-SQL bottom panel collapsed. */
   filterSqlCollapsed: boolean
+  /** Color theme; absent => 'dark' (current look preserved for existing users). */
+  theme?: ThemeMode
 }
 
 // --- DDL: visual table designer spec + change sets ---------------------------
@@ -343,6 +392,13 @@ export type ObjectOp =
   | { kind: 'dropSequence'; schema: string; name: string }
   | { kind: 'dropTrigger'; schema: string; table: string; name: string }
   | { kind: 'dropIndex'; schema: string; table: string; name: string }
+  // PostgreSQL advanced objects (TASK 67)
+  | { kind: 'dropMatView'; schema: string; name: string }
+  | { kind: 'refreshMatView'; schema: string; name: string; concurrently?: boolean }
+  | { kind: 'dropType'; schema: string; name: string; cascade?: boolean }
+  | { kind: 'createExtension'; name: string; schema?: string | null; version?: string | null }
+  | { kind: 'updateExtension'; name: string; version?: string | null }
+  | { kind: 'dropExtension'; name: string; cascade?: boolean }
 
 // --- Views + routines (functions / procedures) -------------------------------
 
@@ -382,7 +438,7 @@ export interface PackageRef {
  */
 export interface ObjectDefRequest {
   connectionId: string
-  kind: 'view' | RoutineKind | 'packageSpec' | 'packageBody'
+  kind: 'view' | 'matview' | RoutineKind | 'packageSpec' | 'packageBody'
   schema: string
   name: string
   signature?: string | null
@@ -508,7 +564,16 @@ export interface IndexInfo {
   constraintBacked: boolean
   /** Oracle: index STATUS (VALID / UNUSABLE), shown for info. */
   status?: string
+  /** PostgreSQL: access method (btree/hash/gin/gist/brin) — undefined elsewhere. */
+  method?: string
+  /** PostgreSQL: partial-index predicate (the WHERE expression), if any. */
+  predicate?: string | null
+  /** PostgreSQL: raw column/expression list from pg_get_indexdef (round-trips expression indexes). */
+  keyExpr?: string | null
 }
+
+/** PostgreSQL index access methods offered in the advanced-index editor. */
+export type PgIndexMethod = 'btree' | 'hash' | 'gin' | 'gist' | 'brin'
 
 /** Create/edit spec for a standalone index. */
 export interface IndexCreateSpec {
@@ -519,6 +584,64 @@ export interface IndexCreateSpec {
   originalName?: string | null
   columns: string[]
   unique: boolean
+  /** PostgreSQL only: access method (default btree when omitted). */
+  method?: PgIndexMethod | null
+  /** PostgreSQL only: partial-index WHERE predicate (raw SQL, no leading WHERE). */
+  where?: string | null
+  /** PostgreSQL only: an index expression (e.g. lower(email)); when set it replaces `columns`. */
+  expression?: string | null
+}
+
+// --- PostgreSQL advanced objects (matviews / types / extensions) — TASK 67 ---
+
+/** A materialized view (PostgreSQL). */
+export interface MatViewRef {
+  schema: string
+  name: string
+  /** False when created/refreshed WITH NO DATA (not yet populated). */
+  populated: boolean
+}
+
+/** listMatViews result: PG returns the list; other engines report unsupported. */
+export interface MatViewList {
+  supported: boolean
+  matviews: MatViewRef[]
+  note?: string
+}
+
+/** A user-defined type (PostgreSQL): enum or composite. */
+export interface TypeRef {
+  schema: string
+  name: string
+  kind: 'enum' | 'composite' | 'other'
+  /** Enum labels in order (enum only). */
+  labels?: string[]
+  /** Composite fields (composite only). */
+  fields?: { name: string; type: string }[]
+}
+
+export interface TypeList {
+  supported: boolean
+  types: TypeRef[]
+  note?: string
+}
+
+/** A PostgreSQL extension (installed and/or available). */
+export interface ExtensionRef {
+  name: string
+  /** Installed version, or null when the extension is only available (not installed). */
+  installedVersion: string | null
+  /** Default version offered by the server. */
+  defaultVersion: string | null
+  comment: string | null
+}
+
+/** listExtensions result: installed + all available (PG only). */
+export interface ExtensionList {
+  supported: boolean
+  installed: ExtensionRef[]
+  available: ExtensionRef[]
+  note?: string
 }
 
 /** Create/edit spec for a trigger (engine-aware DDL generated from it). */
@@ -779,11 +902,122 @@ export interface ImportResult {
   error?: string
 }
 
+// --- Saved filters (TASK 70) -------------------------------------------------
+
+/**
+ * A snapshot of a table's filter state — the same shape the grid uses at
+ * runtime. `filterMode` selects which surface is active; the structured filter
+ * (per-column `filters` + the funnel `builderTree`) and the raw `customWhere`
+ * are stored together so any of them can be recalled.
+ */
+export interface SavedFilterState {
+  filters: ColumnFilter[]
+  builderTree: FilterGroup | null
+  filterMode: 'quick' | 'builder' | 'custom'
+  customWhere: string
+}
+
+/** A named, persisted filter, keyed (in the store) by engine::schema::table. */
+export interface SavedFilter {
+  id: string
+  name: string
+  /** Epoch ms when created/last updated. */
+  updatedAt: number
+  state: SavedFilterState
+}
+
 /** Progress event payload (channel IPC.ioProgress). */
 export interface IoProgress {
-  phase: 'export' | 'import' | 'dump' | 'restore'
+  phase: 'export' | 'import' | 'dump' | 'restore' | 'transfer'
   done: number
   total: number
+}
+
+// --- Cross-engine data transfer (copy tables from ANY engine to ANY other) ----
+
+/** How to handle a target table that already exists in the target schema. */
+export type TransferIfExists = 'skip' | 'drop' | 'append'
+
+/** Optional per-column override in the wizard: skip it, or force a target type. */
+export interface TransferColumnOverride {
+  skip?: boolean
+  /** Force this exact target column type instead of the auto-translated one. */
+  targetType?: string
+}
+
+/** Per-column entry in the transfer plan (source type → chosen target type). */
+export interface TransferColumnPlan {
+  name: string
+  sourceType: string
+  /** The type the column will get on the target engine (auto-translated). */
+  targetType: string
+  autoIncrement: boolean
+  /** Lossy/approximate-mapping warnings for this column (empty if clean). */
+  warnings: string[]
+  /** True if the source type wasn't recognized by the target mapper — review it. */
+  needsReview: boolean
+}
+
+/** Per-table entry in the transfer plan. */
+export interface TransferTablePlan {
+  table: string
+  columns: TransferColumnPlan[]
+  primaryKey: string[]
+  /** True if a table of this name already exists in the target schema. */
+  existsInTarget: boolean
+  /** Number of foreign keys that will be recreated after the data load. */
+  foreignKeys: number
+  /** FKs referencing tables NOT in the transfer set (they will be skipped). */
+  skippedForeignKeys: string[]
+  rowCountEstimate: number | null
+}
+
+/** The full plan the wizard shows before running a transfer. */
+export interface TransferPlan {
+  sourceEngine: Engine
+  targetEngine: Engine
+  tables: TransferTablePlan[]
+  /** Transfer-wide notes (auto-increment translation summary, identity handling). */
+  notes: string[]
+}
+
+export interface TransferPlanRequest {
+  sourceConnectionId: string
+  targetConnectionId: string
+  sourceSchema: string
+  targetSchema: string
+  tables: string[]
+}
+
+export interface TransferRequest {
+  sourceConnectionId: string
+  targetConnectionId: string
+  sourceSchema: string
+  targetSchema: string
+  tables: string[]
+  ifExists: TransferIfExists
+  /** table name -> column name -> override. */
+  overrides?: Record<string, Record<string, TransferColumnOverride>>
+}
+
+/** Per-table outcome of a transfer. */
+export interface TransferTableResult {
+  table: string
+  status: 'created' | 'appended' | 'skipped' | 'failed'
+  rows: number
+  warnings: string[]
+  error?: string
+}
+
+export interface TransferResult {
+  ok: boolean
+  tables: TransferTableResult[]
+  totalRows: number
+  /** FK constraints that couldn't be recreated after loading (with reasons). */
+  fkWarnings: string[]
+  /** Always true — a transfer never writes to the source. */
+  sourceUnchanged: boolean
+  error?: string
 }
 
 // --- Database dump / restore (SQL file) --------------------------------------
@@ -840,9 +1074,20 @@ export interface AppInfo {
 export interface DbApi {
   // Connection persistence (stored in userData, never in the repo)
   listConnections(): Promise<SafeConnectionConfig[]>
-  saveConnection(config: ConnectionConfig): Promise<IpcResult<SafeConnectionConfig>>
+  /** Save returns the (secret-stripped) config, plus a `warning` when a secret couldn't be persisted. */
+  saveConnection(config: ConnectionConfig): Promise<IpcResult<SafeConnectionConfig & { warning?: string }>>
   deleteConnection(id: string): Promise<IpcResult<null>>
   getDefaults(): Promise<ConnectionConfig[]>
+  /** Whether OS-backed secure storage is available (else passwords can't be encrypted). */
+  secureStorageAvailable(): Promise<boolean>
+
+  // Saved filters (per table, persisted in userData) — TASK 70
+  /** Saved filters for a table key (engine::schema::table). */
+  listSavedFilters(key: string): Promise<IpcResult<SavedFilter[]>>
+  /** Create/update a saved filter (upsert by id); returns the updated list. */
+  saveSavedFilter(key: string, filter: SavedFilter): Promise<IpcResult<SavedFilter[]>>
+  /** Delete a saved filter by id; returns the updated list. */
+  deleteSavedFilter(key: string, id: string): Promise<IpcResult<SavedFilter[]>>
 
   // Live database operations (all run in main; drivers never touch renderer)
   testConnection(config: ConnectionConfig): Promise<TestConnectionResult>
@@ -922,6 +1167,11 @@ export interface DbApi {
   // Indexes (all engines) — listed per table
   listIndexes(id: string, schema: string, table: string): Promise<IpcResult<IndexInfo[]>>
 
+  // PostgreSQL advanced objects (TASK 67) — other engines report { supported:false }
+  listMatViews(id: string, schema: string): Promise<IpcResult<MatViewList>>
+  listTypes(id: string, schema: string): Promise<IpcResult<TypeList>>
+  listExtensions(id: string): Promise<IpcResult<ExtensionList>>
+
   // Import / Export (data)
   /** Export a table / active-filter result to a file (opens a save dialog). */
   exportData(req: ExportRequest): Promise<IpcResult<ExportResult>>
@@ -933,6 +1183,12 @@ export interface DbApi {
   importExecute(req: ImportRequest): Promise<IpcResult<ImportResult>>
   /** Subscribe to export/import progress; returns an unsubscribe function. */
   onIoProgress(cb: (p: IoProgress) => void): () => void
+
+  // Cross-engine data transfer (copy tables from ANY connection to ANY other)
+  /** Build the type-translation plan + lossy-mapping warnings for a transfer. */
+  transferPlan(req: TransferPlanRequest): Promise<IpcResult<TransferPlan>>
+  /** Run a transfer: create tables on the target, copy data, add FKs. Source read-only. */
+  transferRun(req: TransferRequest): Promise<IpcResult<TransferResult>>
 
   // Database dump / restore (whole-DB SQL file)
   /** Dump a database/schema (DDL + optional data) to a .sql file (save dialog). */
@@ -959,12 +1215,22 @@ export interface DbApi {
   getAppInfo(): Promise<AppInfo>
   /** Open an http(s)/mailto URL in the OS default browser/mail client (validated in MAIN). */
   openExternal(url: string): Promise<IpcResult<null>>
+
+  // Native application menu (TASK 72)
+  /** Subscribe to menu clicks dispatched from MAIN; returns an unsubscribe fn. */
+  onMenuAction(cb: (action: MenuAction) => void): () => void
+  /** Tell MAIN the theme changed so it can refresh the View ▸ Theme checkmark. */
+  notifyThemeChanged(theme: ThemeMode): void
 }
 
 /** IPC channel names — single source of truth for both sides. */
 export const IPC = {
   listConnections: 'db:listConnections',
   saveConnection: 'db:saveConnection',
+  secureStorageAvailable: 'db:secureStorageAvailable',
+  listSavedFilters: 'db:listSavedFilters',
+  saveSavedFilter: 'db:saveSavedFilter',
+  deleteSavedFilter: 'db:deleteSavedFilter',
   deleteConnection: 'db:deleteConnection',
   getDefaults: 'db:getDefaults',
   testConnection: 'db:testConnection',
@@ -1002,10 +1268,15 @@ export const IPC = {
   listTriggers: 'db:listTriggers',
   getTriggerDetails: 'db:getTriggerDetails',
   listIndexes: 'db:listIndexes',
+  listMatViews: 'db:listMatViews',
+  listTypes: 'db:listTypes',
+  listExtensions: 'db:listExtensions',
   exportData: 'db:exportData',
   importPickFile: 'db:importPickFile',
   importPreview: 'db:importPreview',
   importExecute: 'db:importExecute',
+  transferPlan: 'db:transferPlan',
+  transferRun: 'db:transferRun',
   ioProgress: 'db:ioProgress',
   dumpDatabase: 'db:dumpDatabase',
   pickSqlFile: 'db:pickSqlFile',
@@ -1016,7 +1287,9 @@ export const IPC = {
   saveErLayout: 'db:saveErLayout',
   saveDiagramImage: 'db:saveDiagramImage',
   getAppInfo: 'db:getAppInfo',
-  openExternal: 'db:openExternal'
+  openExternal: 'db:openExternal',
+  menuAction: 'app:menuAction',
+  menuThemeChanged: 'app:menuThemeChanged'
 } as const
 
 /** Default row cap for table browsing / SELECT preview in this slice. */

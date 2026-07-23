@@ -1,6 +1,6 @@
 import type { MouseEvent as ReactMouseEvent } from 'react'
 import { IconRefresh } from '../actionIcons'
-import type { IndexInfo, PackageRef, RoutineRef, SequenceRef, TableRef, TriggerRef, ViewRef } from '@shared/types'
+import type { ExtensionRef, IndexInfo, MatViewRef, PackageRef, RoutineRef, SequenceRef, TableRef, TriggerRef, TypeRef, ViewRef } from '@shared/types'
 import { useStore, type ObjCategory, type TreeColumn } from '../store'
 import {
   Chevron,
@@ -22,6 +22,12 @@ import {
   IconSchema,
   IconSequence,
   IconSequencesCat,
+  IconMatViewsCat,
+  IconTypesCat,
+  IconExtensionsCat,
+  IconMatView,
+  IconType,
+  IconExtension,
   IconTable,
   IconTablesCat,
   IconTrigger,
@@ -41,14 +47,14 @@ export function ObjectTree(): JSX.Element {
   const openEditRoutine = useStore((s) => s.openEditRoutine)
   const openEditPackagePart = useStore((s) => s.openEditPackagePart)
   const openEditSequence = useStore((s) => s.openEditSequence)
+  const openEditMatView = useStore((s) => s.openEditMatView)
   const toggleTableExpand = useStore((s) => s.toggleTableExpand)
   const toggleTableColumns = useStore((s) => s.toggleTableColumns)
   const toggleTableTriggers = useStore((s) => s.toggleTableTriggers)
   const openEditTrigger = useStore((s) => s.openEditTrigger)
   const toggleTableIndexes = useStore((s) => s.toggleTableIndexes)
   const openEditIndex = useStore((s) => s.openEditIndex)
-  const refreshCatalog = useStore((s) => s.refreshCatalog)
-  const loadSchemas = useStore((s) => s.loadSchemas)
+  const refreshTree = useStore((s) => s.refreshTree)
   const engineOf = useStore((s) => s.engineOf)
   const openContextMenu = useStore((s) => s.openContextMenu)
 
@@ -98,8 +104,7 @@ export function ObjectTree(): JSX.Element {
             className="refresh-link"
             title="Refresh schema (tree + autocomplete)"
             onClick={() => {
-              void loadSchemas(connId)
-              void refreshCatalog(connId)
+              void refreshTree(connId)
             }}
           >
             <IconRefresh size={13} />
@@ -120,12 +125,18 @@ export function ObjectTree(): JSX.Element {
             const procedures: RoutineRef[] = tree.proceduresBySchema[schema] ?? []
             const packages: PackageRef[] = tree.packagesBySchema[schema] ?? []
             const sequences: SequenceRef[] = tree.sequencesBySchema[schema] ?? []
+            const matviews: MatViewRef[] = tree.matviewsBySchema[schema] ?? []
+            const types: TypeRef[] = tree.typesBySchema[schema] ?? []
+            const extensions: ExtensionRef[] = tree.extensionsBySchema[schema] ?? []
             const tablesOpen = tree.expandedCats.includes(`${schema}::tables`)
             const viewsOpen = tree.expandedCats.includes(`${schema}::views`)
             const fnsOpen = tree.expandedCats.includes(`${schema}::functions`)
             const procsOpen = tree.expandedCats.includes(`${schema}::procedures`)
             const pkgsOpen = tree.expandedCats.includes(`${schema}::packages`)
             const seqsOpen = tree.expandedCats.includes(`${schema}::sequences`)
+            const mvOpen = tree.expandedCats.includes(`${schema}::matviews`)
+            const typesOpen = tree.expandedCats.includes(`${schema}::types`)
+            const extsOpen = tree.expandedCats.includes(`${schema}::extensions`)
             const schemaCtx = (e: ReactMouseEvent): void => {
               e.preventDefault()
               if (connId) openContextMenu({ x: e.clientX, y: e.clientY, target: { kind: 'schema', connectionId: connId, schema } })
@@ -442,6 +453,63 @@ export function ObjectTree(): JSX.Element {
                           Sequences — {engine === 'mysql' ? 'n/a (AUTO_INCREMENT)' : 'n/a (SQLite)'}
                         </span>
                       </div>
+                    )}
+
+                    {/* PostgreSQL advanced objects (TASK 67) */}
+                    {isPostgres && (
+                      <>
+                        {catRow(`${schema}::matviews`, 'Materialized Views', matviews.length, IconMatViewsCat, () => connId && void toggleCategory(connId, schema, 'matviews' as ObjCategory), schemaCtx)}
+                        {mvOpen &&
+                          (matviews.length === 0 && !loading(`${schema}::matviews`)
+                            ? emptyRow('No materialized views')
+                            : matviews.map((mv) => (
+                                <div
+                                  key={'mv.' + mv.name}
+                                  className="tree-node object"
+                                  onClick={() => connId && void openEditMatView(connId, schema, mv.name)}
+                                  onContextMenu={(e) => { e.preventDefault(); if (connId) openContextMenu({ x: e.clientX, y: e.clientY, target: { kind: 'matview', connectionId: connId, schema, name: mv.name, populated: mv.populated } }) }}
+                                  title={`Materialized view ${mv.name}${mv.populated ? '' : ' (not populated — refresh it)'}`}
+                                >
+                                  <ChevronSpacer />
+                                  <IconMatView className="obj-icon view" />
+                                  <span className="tree-label">{mv.name}{mv.populated ? '' : <span className="sys-tag"> unpopulated</span>}</span>
+                                </div>
+                              )))}
+
+                        {catRow(`${schema}::types`, 'Types', types.length, IconTypesCat, () => connId && void toggleCategory(connId, schema, 'types' as ObjCategory), schemaCtx)}
+                        {typesOpen &&
+                          (types.length === 0 && !loading(`${schema}::types`)
+                            ? emptyRow('No user-defined types')
+                            : types.map((ty) => (
+                                <div
+                                  key={'ty.' + ty.name}
+                                  className="tree-node object"
+                                  onContextMenu={(e) => { e.preventDefault(); if (connId) openContextMenu({ x: e.clientX, y: e.clientY, target: { kind: 'type', connectionId: connId, schema, name: ty.name, typeKind: ty.kind } }) }}
+                                  title={ty.kind === 'enum' ? `Enum ${ty.name}: ${(ty.labels ?? []).join(', ')}` : ty.kind === 'composite' ? `Composite ${ty.name}: ${(ty.fields ?? []).map((f) => f.name + ' ' + f.type).join(', ')}` : `Type ${ty.name}`}
+                                >
+                                  <ChevronSpacer />
+                                  <IconType className="obj-icon" />
+                                  <span className="tree-label">{ty.name} <span className="sys-tag">{ty.kind}</span></span>
+                                </div>
+                              )))}
+
+                        {catRow(`${schema}::extensions`, 'Extensions', extensions.length, IconExtensionsCat, () => connId && void toggleCategory(connId, schema, 'extensions' as ObjCategory), (e) => { e.preventDefault(); if (connId) openContextMenu({ x: e.clientX, y: e.clientY, target: { kind: 'extensionsCat', connectionId: connId, schema } }) })}
+                        {extsOpen &&
+                          (extensions.length === 0 && !loading(`${schema}::extensions`)
+                            ? emptyRow('No extensions installed')
+                            : extensions.map((ex) => (
+                                <div
+                                  key={'ex.' + ex.name}
+                                  className="tree-node object"
+                                  onContextMenu={(e) => { e.preventDefault(); if (connId) openContextMenu({ x: e.clientX, y: e.clientY, target: { kind: 'extension', connectionId: connId, name: ex.name, installedVersion: ex.installedVersion, defaultVersion: ex.defaultVersion } }) }}
+                                  title={`Extension ${ex.name} ${ex.installedVersion ?? ''}${ex.comment ? ' — ' + ex.comment : ''}`}
+                                >
+                                  <ChevronSpacer />
+                                  <IconExtension className="obj-icon" />
+                                  <span className="tree-label">{ex.name} <span className="sys-tag">{ex.installedVersion}</span></span>
+                                </div>
+                              )))}
+                      </>
                     )}
                   </>
                 )}

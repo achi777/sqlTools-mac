@@ -405,6 +405,39 @@ export class MysqlDriver implements DbDriver {
     return { ok: true, executed: statements.length }
   }
 
+  // Inherited unchanged by MariaDB (same wire protocol + AUTO_INCREMENT rules).
+  async transferInsert(
+    schema: string,
+    table: string,
+    columns: string[],
+    rows: unknown[][],
+    columnTypes: Record<string, string>,
+    _identityCols: string[]
+  ): Promise<number> {
+    if (rows.length === 0) return 0
+    const t = `${qid(this.schemaName(schema))}.${qid(table)}`
+    const colList = columns.map(qid).join(', ')
+    const rowPh = '(' + columns.map(() => '?').join(', ') + ')'
+    const perChunk = Math.max(1, Math.floor(60000 / columns.length))
+    const conn = await this.ensure().getConnection()
+    try {
+      await conn.beginTransaction()
+      for (let i = 0; i < rows.length; i += perChunk) {
+        const chunk = rows.slice(i, i + perChunk)
+        const placeholders = chunk.map(() => rowPh).join(', ')
+        const params = chunk.flatMap((row) => row.map((v, c) => coerceForWrite(v, columnTypes[columns[c]])))
+        await conn.query(`INSERT INTO ${t} (${colList}) VALUES ${placeholders}`, params)
+      }
+      await conn.commit()
+      return rows.length
+    } catch (err) {
+      await conn.rollback().catch(() => undefined)
+      throw err
+    } finally {
+      conn.release()
+    }
+  }
+
   applyObjectSql(statements: string[]): Promise<DdlApplyResult> {
     return this.execStatements(statements)
   }
@@ -540,8 +573,19 @@ export class MysqlDriver implements DbDriver {
 
   async runQuery(sql: string, params: unknown[] = []): Promise<QueryResult> {
     const started = performance.now()
-    const [rows, fields] = await this.ensure().query(sql, params)
+    let [rows, fields] = await this.ensure().query(sql, params)
     const durationMs = Math.round((performance.now() - started) * 100) / 100
+
+    // A CALL (or multi-statement) returns an ARRAY OF RESULT SETS — rows is an
+    // array whose elements are themselves row-arrays, with a trailing OK packet,
+    // and `fields` is an array of field-arrays (the last often undefined). Pick
+    // the first real result set so `fields.map(f => f.name)` doesn't crash.
+    if (Array.isArray(rows) && rows.some((r) => Array.isArray(r))) {
+      const idx = (rows as unknown[]).findIndex((r) => Array.isArray(r))
+      const fArr = fields as unknown as mysql.FieldPacket[][]
+      rows = (rows as unknown[])[idx] as typeof rows
+      fields = (Array.isArray(fArr) ? fArr[idx] : fields) as typeof fields
+    }
 
     // Non-SELECT statements return an OkPacket (not an array).
     if (!Array.isArray(rows)) {
@@ -555,7 +599,7 @@ export class MysqlDriver implements DbDriver {
       }
     }
 
-    const fieldArr = (fields as mysql.FieldPacket[]) ?? []
+    const fieldArr = ((fields as mysql.FieldPacket[]) ?? []).filter((f) => f && typeof (f as { name?: unknown }).name === 'string')
     const columns: ResultColumn[] = fieldArr.map((f) => ({
       name: f.name,
       dataType: mysqlTypeName(f.type)

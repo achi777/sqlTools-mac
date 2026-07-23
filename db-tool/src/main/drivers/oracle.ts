@@ -114,6 +114,24 @@ function normalize(value: unknown): unknown {
   return value
 }
 
+/**
+ * Coerce a value for binding into Oracle. Like coerceForWrite, but also converts
+ * an ISO date STRING (as produced by CSV/JSON import or by normalize()) into a
+ * JS Date for DATE/TIMESTAMP columns — node-oracledb binds a Date natively,
+ * whereas a bare 'YYYY-MM-DDT…' string raises ORA-01861. Fixes date/time import
+ * and grid-editing of date columns.
+ */
+function oracleBind(value: unknown, sqlType: string | undefined): unknown {
+  const v = coerceForWrite(value, sqlType)
+  if (v == null || typeof v !== 'string') return v
+  const t = (sqlType ?? '').toUpperCase()
+  if (/^(DATE|TIMESTAMP)/.test(t)) {
+    const dt = new Date(v)
+    if (!Number.isNaN(dt.getTime())) return dt
+  }
+  return v
+}
+
 export class OracleDriver implements DbDriver {
   readonly config: ConnectionConfig
   private pool: oracledb.Pool | null = null
@@ -410,7 +428,7 @@ export class OracleDriver implements DbDriver {
         const d = req.deletes[index]
         const cols = Object.keys(d)
         const where = cols.map((c, i) => `${qid(c)} = :${i + 1}`).join(' AND ')
-        const r = await conn.execute(`DELETE FROM ${t} WHERE ${where}`, cols.map((c) => coerceForWrite(d[c], ct[c])) as oracledb.BindParameters, { autoCommit: false })
+        const r = await conn.execute(`DELETE FROM ${t} WHERE ${where}`, cols.map((c) => oracleBind(d[c], ct[c])) as oracledb.BindParameters, { autoCommit: false })
         out.deleted += r.rowsAffected ?? 0
       }
 
@@ -423,8 +441,8 @@ export class OracleDriver implements DbDriver {
         const setSql = setCols.map((c, i) => `${qid(c)} = :${i + 1}`).join(', ')
         const whereSql = pkCols.map((c, i) => `${qid(c)} = :${setCols.length + i + 1}`).join(' AND ')
         const params = [
-          ...setCols.map((c) => coerceForWrite(u.changes[c], ct[c])),
-          ...pkCols.map((c) => coerceForWrite(u.primaryKey[c], ct[c]))
+          ...setCols.map((c) => oracleBind(u.changes[c], ct[c])),
+          ...pkCols.map((c) => oracleBind(u.primaryKey[c], ct[c]))
         ]
         const r = await conn.execute(`UPDATE ${t} SET ${setSql} WHERE ${whereSql}`, params as oracledb.BindParameters, { autoCommit: false })
         out.updated += r.rowsAffected ?? 0
@@ -436,7 +454,7 @@ export class OracleDriver implements DbDriver {
         const ins = req.inserts[index]
         const cols = Object.keys(ins)
         if (cols.length === 0) throw new Error('Oracle: insert with no columns is not supported in this stage')
-        const values = cols.map((c) => coerceForWrite(ins[c], ct[c]))
+        const values = cols.map((c) => oracleBind(ins[c], ct[c]))
         const ph = cols.map((_, i) => `:${i + 1}`).join(', ')
         // RETURNING the generated PK when the PK column wasn't supplied.
         const returnPk = singlePk && !cols.includes(singlePk)
@@ -494,6 +512,38 @@ export class OracleDriver implements DbDriver {
         }
       }
       return { ok: true, executed }
+    } finally {
+      await conn.close()
+    }
+  }
+
+  async transferInsert(
+    schema: string,
+    table: string,
+    columns: string[],
+    rows: unknown[][],
+    columnTypes: Record<string, string>,
+    _identityCols: string[]
+  ): Promise<number> {
+    if (rows.length === 0) return 0
+    const t = this.qtable(schema, table)
+    const colList = columns.map(qid).join(', ')
+    const ph = columns.map((_, i) => `:${i + 1}`).join(', ')
+    const stmt = `INSERT INTO ${t} (${colList}) VALUES (${ph})`
+    const conn = await this.ensure().getConnection()
+    try {
+      // Oracle: single-row binds (no multi-row VALUES). oracleBind turns ISO date
+      // strings into JS Date for DATE/TIMESTAMP columns (avoids ORA-01861) and
+      // maps '' → NULL for non-text columns.
+      for (const row of rows) {
+        const values = row.map((v, c) => oracleBind(v, columnTypes[columns[c]]))
+        await conn.execute(stmt, values as oracledb.BindParameters, { autoCommit: false })
+      }
+      await conn.commit()
+      return rows.length
+    } catch (err) {
+      await conn.rollback().catch(() => undefined)
+      throw err
     } finally {
       await conn.close()
     }
@@ -644,9 +694,50 @@ export class OracleDriver implements DbDriver {
       name: table,
       columns,
       primaryKey: pks.rows.map((r) => String(r.COL)),
-      foreignKeys: [],
+      foreignKeys: await this.foreignKeysOf(owner, table),
       indexes: []
     }
+  }
+
+  /**
+   * Foreign keys on a table (ALL_CONSTRAINTS type 'R'), resolving the referenced
+   * table/columns via R_CONSTRAINT_NAME → the parent PK/UNIQUE constraint. Oracle
+   * has no ON UPDATE rule, so `onUpdate` is always null.
+   */
+  private async foreignKeysOf(owner: string, table: string): Promise<import('@shared/types').ForeignKeySpec[]> {
+    const res = await this.runQuery(
+      `SELECT c.constraint_name AS fk_name, cc.column_name AS col, cc.position AS pos,
+              rc.owner AS ref_owner, rc.table_name AS ref_table, rcc.column_name AS ref_col,
+              c.delete_rule AS del_rule
+       FROM all_constraints c
+       JOIN all_cons_columns cc ON cc.owner = c.owner AND cc.constraint_name = c.constraint_name
+       JOIN all_constraints rc ON rc.owner = c.r_owner AND rc.constraint_name = c.r_constraint_name
+       JOIN all_cons_columns rcc ON rcc.owner = rc.owner AND rcc.constraint_name = rc.constraint_name AND rcc.position = cc.position
+       WHERE c.owner = :1 AND c.table_name = :2 AND c.constraint_type = 'R'
+       ORDER BY c.constraint_name, cc.position`,
+      [owner, table]
+    )
+    const action = (rule: unknown): import('@shared/types').FkAction | null => {
+      const r = String(rule ?? '').toUpperCase()
+      if (r === 'CASCADE') return 'CASCADE'
+      if (r === 'SET NULL') return 'SET NULL'
+      return 'NO ACTION'
+    }
+    const byName = new Map<string, import('@shared/types').ForeignKeySpec>()
+    for (const row of res.rows as Record<string, unknown>[]) {
+      const name = String(row.FK_NAME)
+      let fk = byName.get(name)
+      if (!fk) {
+        fk = {
+          name, columns: [], refSchema: String(row.REF_OWNER), refTable: String(row.REF_TABLE), refColumns: [],
+          onDelete: action(row.DEL_RULE), onUpdate: null
+        }
+        byName.set(name, fk)
+      }
+      fk.columns.push(String(row.COL))
+      fk.refColumns.push(String(row.REF_COL))
+    }
+    return [...byName.values()]
   }
 
   /**

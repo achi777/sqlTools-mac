@@ -16,6 +16,9 @@ import {
   ListTree,
   Loader2,
   Package,
+  Layers,
+  Shapes,
+  Puzzle,
   Table2,
   TerminalSquare,
   Zap,
@@ -59,6 +62,10 @@ export const IconSequencesCat = mk(Hash, CAT)
 export const IconTriggersCat = mk(Zap, CAT)
 export const IconIndexesCat = mk(ListTree, CAT)
 export const IconColumnsCat = mk(Columns3, CAT)
+// PostgreSQL advanced object categories (TASK 67)
+export const IconMatViewsCat = mk(Layers, CAT)
+export const IconTypesCat = mk(Shapes, CAT)
+export const IconExtensionsCat = mk(Puzzle, CAT)
 
 // --- individual objects ---
 export const IconSchema = mk(Boxes)
@@ -71,6 +78,9 @@ export const IconSequence = mk(Hash)
 export const IconTrigger = mk(Zap)
 export const IconIndex = mk(ListTree)
 export const IconIndexUnique = mk(KeyRound)
+export const IconMatView = mk(Layers)
+export const IconType = mk(Shapes)
+export const IconExtension = mk(Puzzle)
 export const IconColumn = mk(Circle, 9)
 export const IconColumnPk = mk(KeyRound, 12)
 export const IconColumnFk = mk(Link2, 12)

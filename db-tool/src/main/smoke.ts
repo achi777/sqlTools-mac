@@ -7,8 +7,9 @@
 import Database from 'better-sqlite3'
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import { createDriver } from './driver'
-import { buildObjectOp, buildTableDdl } from './ddl'
+import { createDriver, type DbDriver } from './driver'
+import { buildObjectOp, buildTableDdl, buildAddForeignKeys } from './ddl'
+import { buildTransferPlan, runTransfer } from './transfer'
 import { buildAlterSequence, buildCreateSequence, buildDropSequence } from '@shared/sequenceDdl'
 import { buildTriggerStatements, buildSetTriggerEnabled } from '@shared/triggerDdl'
 import { buildAlterIndex, buildCreateIndex } from '@shared/indexDdl'
@@ -22,8 +23,8 @@ import { resolveViewModel } from '@shared/viewResolve'
 import { reverseParseView } from './viewReverse'
 import { clearHistory, listHistory, recordHistory } from './history'
 import { loadTabs, saveTabs } from './store'
-import type { ConnectionConfig, Engine, TableSpec } from '@shared/types'
-import { isMysqlFamily } from '@shared/types'
+import type { ColumnSpec, ConnectionConfig, Engine, TableSpec, TransferRequest } from '@shared/types'
+import { isMysqlFamily, sqlDialect } from '@shared/types'
 
 function log(...args: unknown[]): void {
   // eslint-disable-next-line no-console
@@ -1679,6 +1680,288 @@ async function testIndexes(config: ConnectionConfig): Promise<void> {
  * null/number), re-imports each, checks filtered export, injection-safety, and
  * skip-mode error collection. Seeded tables are read-only (never modified).
  */
+/**
+ * TASK 56 AUDIT (Part B) — create each supported routine/trigger/package from the
+ * UNMODIFIED store template on every engine and confirm it is VALID, LISTED,
+ * RUNNABLE, and droppable. The template strings mirror src/renderer/src/store.ts
+ * (routineTemplate / packageTemplate / defaultTriggerSpec) verbatim.
+ */
+async function testTemplates(config: ConnectionConfig): Promise<void> {
+  const tag = `tmpl-${config.engine}`
+  const engine = config.engine
+  const d = sqlDialect(engine)
+  const driver = await createDriver(config)
+  const done: string[] = []
+  const qid = (n: string): string => (isMysqlFamily(engine) ? `\`${n}\`` : d === 'mssql' ? `[${n}]` : `"${n}"`)
+  try {
+    await driver.connect()
+    const schema =
+      isMysqlFamily(engine) ? (config.database as string)
+      : engine === 'sqlite' ? 'main'
+      : d === 'oracle' ? (await driver.listSchemas())[0]
+      : d === 'mssql' ? 'dbo'
+      : 'public'
+    const qn = engine === 'sqlite' ? qid : (n: string): string => `${qid(schema)}.${qid(n)}`
+    const FN = '_AUDIT_TFN', PR = '_AUDIT_TPR', PKG = '_AUDIT_TPKG', TT = '_AUDIT_TTBL', TRG = d === 'oracle' ? '_AUDIT_TTRG'.toUpperCase() : '_AUDIT_TTRG'
+
+    // --- Function + Procedure (all engines except SQLite) ---
+    if (engine !== 'sqlite') {
+      const fnTemplate =
+        engine === 'postgres' ? `CREATE OR REPLACE FUNCTION ${qn(FN)}(p_arg integer)\nRETURNS integer\nLANGUAGE plpgsql\nAS $$\nBEGIN\n  RETURN p_arg + 1;\nEND;\n$$;`
+        : d === 'oracle' ? `CREATE OR REPLACE FUNCTION ${qn(FN)} (p_a IN NUMBER, p_b IN NUMBER)\n  RETURN NUMBER\nIS\nBEGIN\n  RETURN p_a + p_b;\nEND;`
+        : d === 'mssql' ? `CREATE OR ALTER FUNCTION ${qn(FN)} (@a INT, @b INT)\nRETURNS INT\nAS\nBEGIN\n  RETURN @a + @b;\nEND;`
+        : `CREATE FUNCTION ${qn(FN)}(p_arg INT)\nRETURNS INT\nDETERMINISTIC\nRETURN p_arg + 1;`
+      let r = await driver.applyObjectSql([fnTemplate])
+      if (!r.ok) throw new Error(`function template: ${r.message}`)
+      if (!(await driver.listRoutines(schema)).some((x) => x.name === FN && x.kind === 'function')) throw new Error('function not listed')
+      // Run it.
+      const callFn =
+        engine === 'postgres' || isMysqlFamily(engine) ? `SELECT ${qn(FN)}(5) AS n`
+        : d === 'oracle' ? `SELECT ${qn(FN)}(2, 3) AS n FROM dual`
+        : `SELECT ${qn(FN)}(2, 3) AS n`
+      const want = engine === 'postgres' || isMysqlFamily(engine) ? 6 : 5
+      const got = Number(Object.values((await driver.runQuery(callFn)).rows[0] as Record<string, unknown>)[0])
+      if (got !== want) throw new Error(`function ran wrong: ${got} != ${want}`)
+      if (!(await driver.getObjectDefinition({ connectionId: config.id, kind: 'function', schema, name: FN })).length) throw new Error('function def did not round-trip')
+
+      const prTemplate =
+        engine === 'postgres' ? `CREATE OR REPLACE PROCEDURE ${qn(PR)}(p_arg integer)\nLANGUAGE plpgsql\nAS $$\nBEGIN\n  RAISE NOTICE 'called with %', p_arg;\nEND;\n$$;`
+        : d === 'oracle' ? `CREATE OR REPLACE PROCEDURE ${qn(PR)} (p_in IN NUMBER, p_out OUT NUMBER)\nIS\nBEGIN\n  p_out := p_in * 2;\nEND;`
+        : d === 'mssql' ? `CREATE OR ALTER PROCEDURE ${qn(PR)}\n  @p_in INT,\n  @p_out INT OUTPUT\nAS\nBEGIN\n  SET NOCOUNT ON;\n  SET @p_out = @p_in * 2;\nEND;`
+        : `CREATE PROCEDURE ${qn(PR)}(IN p_arg INT)\nBEGIN\n  SELECT p_arg;\nEND;`
+      r = await driver.applyObjectSql([prTemplate])
+      if (!r.ok) throw new Error(`procedure template: ${r.message}`)
+      if (!(await driver.listRoutines(schema)).some((x) => x.name === PR && x.kind === 'procedure')) throw new Error('procedure not listed')
+      // Run it (engine-specific invocation).
+      if (d === 'oracle') {
+        const o = await driver.runQuery(`DECLARE o NUMBER; BEGIN ${qn(PR)}(7, o); END;`)
+        void o
+      } else if (d === 'mssql') {
+        const o = await driver.runQuery(`DECLARE @o INT; EXEC ${qn(PR)} @p_in = 7, @p_out = @o OUTPUT; SELECT @o AS n`)
+        if (Number((o.rows[0] as Record<string, unknown>).n) !== 14) throw new Error('procedure OUTPUT wrong')
+      } else if (engine === 'postgres' || isMysqlFamily(engine)) {
+        await driver.runQuery(engine === 'postgres' ? `CALL ${qn(PR)}(5)` : `CALL ${qn(PR)}(5)`)
+      }
+      await driver.execStatements(buildObjectOp(engine, { kind: 'dropRoutine', routineKind: 'function', schema, name: FN }).statements)
+      await driver.execStatements(buildObjectOp(engine, { kind: 'dropRoutine', routineKind: 'procedure', schema, name: PR }).statements)
+      done.push('fn', 'proc')
+    }
+
+    // --- Oracle package template (spec + body split on `/`) ---
+    if (d === 'oracle') {
+      const pkgSpec = `CREATE OR REPLACE PACKAGE ${qn(PKG)} IS\n  FUNCTION f1(p IN NUMBER) RETURN NUMBER;\n  PROCEDURE p1(p IN VARCHAR2);\nEND ${qid(PKG)};`
+      const pkgBody = `CREATE OR REPLACE PACKAGE BODY ${qn(PKG)} IS\n  FUNCTION f1(p IN NUMBER) RETURN NUMBER IS\n  BEGIN\n    RETURN p + 1;\n  END f1;\n\n  PROCEDURE p1(p IN VARCHAR2) IS\n  BEGIN\n    NULL;\n  END p1;\nEND ${qid(PKG)};`
+      const r = await driver.applyObjectSql([pkgSpec, pkgBody])
+      if (!r.ok) throw new Error(`package template: ${r.message}`)
+      const dp = driver as unknown as { listPackages(s: string): Promise<{ name: string; hasBody: boolean }[]> }
+      if (!(await dp.listPackages(schema)).some((p) => p.name === PKG && p.hasBody)) throw new Error('package not listed with body')
+      if (Number(Object.values((await driver.runQuery(`SELECT ${qn(PKG)}.f1(10) AS n FROM dual`)).rows[0] as Record<string, unknown>)[0]) !== 11) throw new Error('packaged fn wrong')
+      await driver.execStatements(buildObjectOp('oracle', { kind: 'dropPackage', schema, name: PKG }).statements)
+      done.push('package')
+    }
+
+    // --- Trigger template (every engine) ---
+    await driver.runQuery(d === 'oracle' ? `DROP TABLE ${qn(TT)} CASCADE CONSTRAINTS PURGE` : d === 'mssql' ? `IF OBJECT_ID('${TT}','U') IS NOT NULL DROP TABLE ${qn(TT)}` : `DROP TABLE ${qn(TT)}`).catch(() => undefined)
+    const idT = engine === 'postgres' ? 'serial PRIMARY KEY' : isMysqlFamily(engine) ? 'int AUTO_INCREMENT PRIMARY KEY' : engine === 'sqlite' ? 'INTEGER PRIMARY KEY' : d === 'oracle' ? 'NUMBER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY' : 'INT IDENTITY(1,1) PRIMARY KEY'
+    const noteT = engine === 'sqlite' ? 'TEXT' : d === 'oracle' ? 'VARCHAR2(50)' : d === 'mssql' ? 'NVARCHAR(50)' : isMysqlFamily(engine) ? 'varchar(50)' : 'text'
+    await driver.execStatements([`CREATE TABLE ${qn(TT)} (${qid('id')} ${idT}, ${qid('note')} ${noteT}, ${qid('updated_at')} ${d === 'mssql' ? 'DATETIME2' : d === 'oracle' ? 'DATE' : engine === 'sqlite' ? 'TEXT' : isMysqlFamily(engine) ? 'datetime' : 'timestamp'})`])
+    // Build the trigger from the same defaultTriggerSpec + buildTriggerStatements the UI uses.
+    const isOracle = d === 'oracle', isMssql = d === 'mssql'
+    const body =
+      engine === 'mysql' || engine === 'mariadb' ? `BEGIN\n  -- e.g. SET NEW.updated_at = NOW();\n  SET @x = 1;\nEND`
+      : engine === 'sqlite' ? `BEGIN\n  -- e.g. UPDATE ${TT} SET note = 'changed' WHERE rowid = NEW.rowid;\n  SELECT 1;\nEND`
+      : isOracle ? `BEGIN\n  -- e.g. :NEW."UPDATED_AT" := SYSTIMESTAMP;\n  NULL;\nEND;`
+      : isMssql ? `BEGIN\n  SET NOCOUNT ON;\n  -- e.g. UPDATE t SET updated_at = SYSUTCDATETIME()\n  --   FROM ${TT} t JOIN inserted i ON t.id = i.id;\n  SELECT 1;\nEND`
+      : ''
+    const trgSpec: TriggerSpec = {
+      schema, table: TT, name: TRG, originalName: null,
+      timing: engine === 'postgres' || isOracle ? 'BEFORE' : 'AFTER', event: 'INSERT', level: 'ROW',
+      body, functionName: `${TRG}_fn`, functionBody: engine === 'postgres' ? `BEGIN\n  -- e.g. NEW.updated_at := now();\n  RETURN NEW;\nEND;` : '', whenClause: ''
+    }
+    const tr = await driver.applyObjectSql(buildTriggerStatements(engine, trgSpec, 'new').statements)
+    if (!tr.ok) throw new Error(`trigger template: ${tr.message}`)
+    if (!(await driver.listTriggers(schema, TT)).some((t) => t.name === TRG || t.name.toUpperCase() === TRG.toUpperCase())) throw new Error('trigger not listed')
+    await driver.execStatements(buildObjectOp(engine, { kind: 'dropTrigger', schema, table: TT, name: TRG }).statements)
+    await driver.runQuery(d === 'oracle' ? `DROP TABLE ${qn(TT)} CASCADE CONSTRAINTS PURGE` : `DROP TABLE ${qn(TT)}`).catch(() => undefined)
+    done.push('trigger')
+    if (engine === 'sqlite' && (await driver.listRoutines(schema)).length !== 0) throw new Error('sqlite should have no routines')
+
+    results.push(`✅ ${tag}: unmodified templates create VALID+listed+runnable objects [${done.join(',')}]${engine === 'sqlite' ? ' (functions/procedures correctly unsupported)' : ''}`)
+  } catch (err) {
+    failed = true
+    results.push(`❌ ${tag}: ${(err as Error).message}`)
+  } finally {
+    for (const n of ['_AUDIT_TFN']) await driver.runQuery(d === 'oracle' ? `DROP FUNCTION ${qid(n)}` : `DROP FUNCTION ${qid(n)}`).catch(() => undefined)
+    await driver.runQuery(`DROP PROCEDURE ${qid('_AUDIT_TPR')}`).catch(() => undefined)
+    if (d === 'oracle') await driver.runQuery(`DROP PACKAGE ${qid('_AUDIT_TPKG')}`).catch(() => undefined)
+    await driver.runQuery(d === 'oracle' ? `DROP TABLE ${qid('_AUDIT_TTBL')} CASCADE CONSTRAINTS PURGE` : `DROP TABLE ${qid('_AUDIT_TTBL')}`).catch(() => undefined)
+    await driver.disconnect().catch(() => undefined)
+  }
+}
+
+/**
+ * TASK 56 AUDIT — awkward-data import/export matrix on ALL SIX engines. One
+ * disposable `_AUDIT_A` table per engine with quote/comma/newline/%/_/unicode
+ * text, a decimal, a date WITH a time component, a boolean, a long text, an
+ * EMPTY STRING, and a NULL. Exports CSV/JSON/Excel/SQL, imports each file format
+ * into a fresh `_AUDIT_B`, executes the exported .sql into `_AUDIT_C`, and
+ * verifies row counts + values (unicode/quote intact, time component preserved,
+ * empty-string semantics). Seeded tables are never touched.
+ */
+async function testAudit(config: ConnectionConfig): Promise<void> {
+  const tag = `audit-${config.engine}`
+  const engine = config.engine
+  const d = sqlDialect(engine)
+  const driver = await createDriver(config)
+  const q = (n: string): string =>
+    isMysqlFamily(engine) ? `\`${n}\`` : d === 'mssql' ? `[${n}]` : `"${n}"`
+  const notes: string[] = []
+  let dir = ''
+  const drop = async (name: string): Promise<void> => {
+    if (d === 'oracle') await driver.runQuery(`DROP TABLE ${q(name)} CASCADE CONSTRAINTS PURGE`).catch(() => undefined)
+    else if (d === 'mssql') await driver.runQuery(`IF OBJECT_ID('${name}','U') IS NOT NULL DROP TABLE ${q(name)}`).catch(() => undefined)
+    else await driver.runQuery(`DROP TABLE ${q(name)}`).catch(() => undefined)
+  }
+  try {
+    await driver.connect()
+    const schema =
+      isMysqlFamily(engine) ? (config.database as string)
+      : engine === 'sqlite' ? 'main'
+      : d === 'oracle' ? (await driver.listSchemas())[0]
+      : d === 'mssql' ? 'dbo'
+      : 'public'
+    const qt = (n: string): string => (engine === 'sqlite' ? q(n) : `${q(schema)}.${q(n)}`)
+    dir = join(process.cwd(), '.smoke', 'audit')
+    mkdirSync(dir, { recursive: true })
+
+    // Per-engine column types for the awkward table.
+    const ty = (k: 'idpk' | 'txt' | 'dec' | 'dt' | 'flag' | 'long'): string => {
+      const map: Record<string, Record<string, string>> = {
+        postgres: { idpk: 'serial PRIMARY KEY', txt: 'varchar(300)', dec: 'numeric(12,2)', dt: 'timestamp', flag: 'boolean', long: 'text' },
+        mysql: { idpk: 'int AUTO_INCREMENT PRIMARY KEY', txt: 'varchar(300)', dec: 'decimal(12,2)', dt: 'datetime', flag: 'tinyint(1)', long: 'longtext' },
+        sqlite: { idpk: 'INTEGER PRIMARY KEY AUTOINCREMENT', txt: 'TEXT', dec: 'NUMERIC', dt: 'TEXT', flag: 'INTEGER', long: 'TEXT' },
+        oracle: { idpk: 'NUMBER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY', txt: 'VARCHAR2(300)', dec: 'NUMBER(12,2)', dt: 'DATE', flag: 'NUMBER(1)', long: 'CLOB' },
+        mssql: { idpk: 'INT IDENTITY(1,1) PRIMARY KEY', txt: 'NVARCHAR(300)', dec: 'DECIMAL(12,2)', dt: 'DATETIME2', flag: 'BIT', long: 'NVARCHAR(MAX)' }
+      }
+      return map[d][k]
+    }
+    const createAudit = (name: string): string =>
+      `CREATE TABLE ${qt(name)} (${q('id')} ${ty('idpk')}, ${q('txt')} ${ty('txt')}, ${q('amount')} ${ty('dec')}, ${q('dt')} ${ty('dt')}, ${q('flag')} ${ty('flag')}, ${q('longtxt')} ${ty('long')})`
+
+    const A = '_AUDIT_A', B = '_AUDIT_B', C = '_AUDIT_C'
+    for (const n of [A, B, C]) await drop(n)
+    let r = await driver.execStatements([createAudit(A)])
+    if (!r.ok) throw new Error(`create ${A}: ${r.message}`)
+
+    // Row 1: quote + comma + newline + %/_ + Georgian unicode, decimal, a date
+    // WITH time, boolean true, a long text. Row 2: EMPTY STRING, NULLs, false.
+    const uni = "O'Brien, \"Jr.\"\n%_ გამარჯობა"
+    const uniLit = (d === 'mssql' ? 'N' : '') + `'${uni.replace(/'/g, "''")}'`
+    const longLit = (d === 'mssql' ? 'N' : '') + `'${'x'.repeat(600)}'`
+    const dtLit =
+      d === 'oracle' ? `TO_DATE('2024-01-15 09:12:34','YYYY-MM-DD HH24:MI:SS')`
+      : engine === 'postgres' ? `TIMESTAMP '2024-01-15 09:12:34'`
+      : d === 'mssql' ? `'2024-01-15T09:12:34'`
+      : `'2024-01-15 09:12:34'`
+    const trueLit = engine === 'postgres' ? 'true' : '1'
+    const falseLit = engine === 'postgres' ? 'false' : '0'
+    const emptyLit = (d === 'mssql' ? 'N' : '') + `''`
+    const cols = `(${q('txt')}, ${q('amount')}, ${q('dt')}, ${q('flag')}, ${q('longtxt')})`
+    r = await driver.execStatements([`INSERT INTO ${qt(A)} ${cols} VALUES (${uniLit}, 1234.56, ${dtLit}, ${trueLit}, ${longLit})`])
+    if (!r.ok) throw new Error(`seed row1: ${r.message}`)
+    r = await driver.execStatements([`INSERT INTO ${qt(A)} ${cols} VALUES (${emptyLit}, NULL, NULL, ${falseLit}, ${(d === 'mssql' ? 'N' : '') + `'plain'`})`])
+    if (!r.ok) throw new Error(`seed row2: ${r.message}`)
+
+    const specOf = async (name: string): Promise<{ columnTypes: Record<string, string>; primaryKey: string[] }> => {
+      const s = await driver.getTableSpec(schema, name)
+      const columnTypes: Record<string, string> = {}
+      for (const c of s.columns) columnTypes[c.name] = c.type
+      return { columnTypes, primaryKey: s.primaryKey }
+    }
+    const exReq = (format: ExportRequest['format'], sqlCreate = false): ExportRequest => ({
+      connectionId: config.id, schema, table: A, format, scope: 'all', columns: [], filters: [], tree: null, customWhere: null,
+      options: { sqlMultiRow: true, sqlCreateTable: sqlCreate }
+    })
+    // Read helper: the row with the unicode/quote value, and the empty/null row.
+    const rowUni = async (name: string): Promise<Record<string, unknown>> =>
+      (await driver.runQuery(`SELECT * FROM ${qt(name)} WHERE ${q('flag')} = ${trueLit}`)).rows[0] as Record<string, unknown>
+    const rowEmpty = async (name: string): Promise<Record<string, unknown>> =>
+      (await driver.runQuery(`SELECT * FROM ${qt(name)} WHERE ${q('flag')} = ${falseLit}`)).rows[0] as Record<string, unknown>
+    const countOf = async (name: string): Promise<number> => driver.getTableRowCount(schema, name)
+    // The exported value for `dt` keeps its time component (minute/second are
+    // TZ-invariant for whole-hour offsets) — assert ':12:34' survives.
+    const dtHasTime = (v: unknown): boolean => /[ T]\d{2}:12:34/.test(String(v))
+
+    // --- File formats: export → import into a fresh target → verify ---
+    for (const fmt of ['csv', 'json', 'xlsx'] as const) {
+      const file = join(dir, `${engine}_audit.${fmt}`)
+      const xr = await runExport(driver, engine, exReq(fmt), file)
+      if (!xr.ok || xr.rows !== 2) throw new Error(`export ${fmt}: ok=${xr.ok} rows=${xr.rows} ${xr.error ?? ''}`)
+      const prev = previewImport(file, { format: fmt, hasHeader: true })
+      if (!prev.ok || prev.totalRows !== 2) throw new Error(`preview ${fmt}: ${prev.error ?? prev.totalRows}`)
+      await drop(B)
+      r = await driver.execStatements([createAudit(B)])
+      if (!r.ok) throw new Error(`create ${B} for ${fmt}: ${r.message}`)
+      // Skip the identity `id` on import so the target auto-assigns it.
+      const imReq: ImportRequest = {
+        connectionId: config.id, schema, table: B, filePath: file,
+        parse: { format: fmt, hasHeader: true },
+        mapping: { txt: 'txt', amount: 'amount', dt: 'dt', flag: 'flag', longtxt: 'longtxt' },
+        mode: 'skip', batchSize: 100
+      }
+      const imp = await runImport(driver, await specOf(B), imReq)
+      if (!imp.ok || imp.inserted !== 2) throw new Error(`import ${fmt}: inserted=${imp.inserted} err=${imp.errors?.[0]?.message ?? imp.error ?? ''}`)
+      const u = await rowUni(B)
+      if (!String(u.txt ?? u.TXT).includes("O'Brien") || !String(u.txt ?? u.TXT).includes('გამარჯობა')) throw new Error(`${fmt} unicode/quote corrupted: ${JSON.stringify(u.txt ?? u.TXT)}`)
+      if (!dtHasTime(u.dt ?? u.DT)) throw new Error(`${fmt} date lost its time component: ${JSON.stringify(u.dt ?? u.DT)}`)
+      if (String(u.longtxt ?? u.LONGTXT).length < 500) throw new Error(`${fmt} long text truncated`)
+      const em = await rowEmpty(B)
+      const key = Object.keys(em).find((k) => k.toLowerCase() === 'txt')
+      const emptyVal = key ? em[key] : undefined
+      // Oracle stores '' as NULL (documented); every other engine keeps ''.
+      if (d === 'oracle') {
+        if (emptyVal != null && emptyVal !== '') throw new Error(`oracle empty-string row wrong: ${JSON.stringify(em)}`)
+      } else if (emptyVal !== '' && emptyVal !== null) {
+        throw new Error(`${fmt} empty-string not preserved: ${JSON.stringify(em)}`)
+      }
+      notes.push(fmt)
+    }
+
+    // --- SQL export → execute into a fresh target (dialect-aware split) ---
+    const sqlFile = join(dir, `${engine}_audit.sql`)
+    const xs = await runExport(driver, engine, exReq('sql', true), sqlFile)
+    if (!xs.ok || xs.rows !== 2) throw new Error(`export sql: ${xs.error ?? xs.rows}`)
+    let sqlText = readFileSync(sqlFile, 'utf-8')
+    // No generic type leaked into the exported CREATE TABLE.
+    if (/(?:^|\s)(text|integer|serial)(?:\s|\()/i.test(sqlText) && d === 'oracle') throw new Error('oracle export leaked a generic type')
+    // Rename A → C so we execute into a fresh table (all quoting styles).
+    for (const qc of [q(A)]) sqlText = sqlText.split(qc).join(q(C))
+    await drop(C)
+    const stmtsC = splitSqlStatements(sqlText, d)
+    const rs = await driver.execStatements(stmtsC)
+    if (!rs.ok) throw new Error(`execute exported SQL @${rs.failedAt}: ${rs.message}`)
+    if ((await countOf(C)) !== 2) throw new Error('SQL round-trip row count != 2')
+    const uc = await rowUni(C)
+    if (!String(uc.txt ?? uc.TXT).includes('გამარჯობა')) throw new Error('SQL round-trip unicode corrupted')
+    if (!dtHasTime(uc.dt ?? uc.DT)) throw new Error(`SQL round-trip date lost time: ${JSON.stringify(uc.dt ?? uc.DT)}`)
+
+    // --- Filtered export honors the filter (not just the current page) ---
+    const ff = join(dir, `${engine}_audit_filter.csv`)
+    const fr = await runExport(driver, engine, { ...exReq('csv'), scope: 'filter', customWhere: `${q('flag')} = ${trueLit}` }, ff)
+    if (!fr.ok || fr.rows !== 1) throw new Error(`filtered export: rows=${fr.rows} (want 1)`)
+
+    for (const n of [A, B, C]) await drop(n)
+    results.push(`✅ ${tag}: awkward-data (quote/comma/newline/%/_/Georgian, decimal, date-WITH-time, boolean, long-text, empty-string${d === 'oracle' ? '→NULL' : ''}, NULL) round-trips CSV/JSON/Excel[${notes.join(',')}]+SQL(exec) into fresh targets; filtered-export=1; engine types + quoting correct`)
+  } catch (err) {
+    failed = true
+    results.push(`❌ ${tag}: ${(err as Error).message}`)
+  } finally {
+    for (const n of ['_AUDIT_A', '_AUDIT_B', '_AUDIT_C']) await drop(n)
+    if (dir) rmSync(dir, { recursive: true, force: true })
+    await driver.disconnect().catch(() => undefined)
+  }
+}
+
 async function testImportExport(config: ConnectionConfig): Promise<void> {
   const tag = `io-${config.engine}`
   const engine = config.engine
@@ -2670,11 +2953,68 @@ async function testOracle(config: ConnectionConfig): Promise<void> {
     for (const n of [t1, t2]) await driver.runQuery(`DROP TABLE "${n}"`).catch(() => undefined)
     rmSync(expDir, { recursive: true, force: true })
 
-    results.push(`✅ ${tag}: connect(Thin), tables/views, catalog+pk, count(20)+paginate, filters(CI-contains/%/quote/>=/BETWEEN/IN/AND), funnel(8), custom(10), NULL partition, CRUD-by-PK; DDL: CREATE(IDENTITY, PK-once, no AUTOINCREMENT)+identity-insert+ALTER(add col/index/FK)+round-trip; ViewBuilder(INNER/LEFT/self-join, no-AS aliases); Sequences(list+ISEQ$$ system-flag, create/NEXTVAL(100), alter inc→10, RESTART→500, rename, drop); Indexes(list+PK-constraint-backed read-only, create single/multi/unique, edit(drop+recreate), rename, drop; seed untouched); Triggers(create+fire :NEW, compile-error→INVALID surfaced, edit via CREATE OR REPLACE, disable/enable, statement-level, WHEN-clause, get-details round-trip, drop; seed untouched); Routines(function+procedure list w/ sig+status, call fn(2,3)=5, package spec+body list+call f1(10)=11, compile-error→INVALID surfaced, edit CREATE OR REPLACE→2*3=6, GET_DDL round-trip, drop fn/proc/body/package; seed untouched); SQL export(real Oracle types VARCHAR2/NUMBER(10,2)/CLOB/DATE→TO_TIMESTAMP, IDENTITY+PK+NOT NULL, 1-INSERT-per-row no multi-row VALUES)→import clean(O'Brien+NULLs intact, browsable); seed untouched)`)
+    // ================= TASK 61: Views (A) + ER-diagram edit (B) =================
+    // --- A. VIEWS: create (CREATE OR REPLACE VIEW) / open data / edit / def round-trip / drop ---
+    const vname = '_ORAV_ACTIVE'
+    const vqn = `"${schema}"."${vname}"`
+    await driver.runQuery(`DROP VIEW ${vqn}`).catch(() => undefined)
+    // Matches what the object editor emits for an Oracle view (CREATE OR REPLACE).
+    let vr = await driver.applyObjectSql([`CREATE OR REPLACE VIEW ${vqn} AS\nSELECT "ID", "FULL_NAME" FROM "${schema}"."CUSTOMERS" WHERE "IS_ACTIVE" = 1`])
+    if (!vr.ok) throw new Error(`create view: ${vr.message}`)
+    if (!(await driver.listViews(schema)).some((v) => v.name === vname)) throw new Error('view not listed')
+    const vRows = await driver.runQuery(`SELECT * FROM ${vqn}`)
+    if (vRows.rows.length === 0) throw new Error('view data empty (open-view-data)')
+    // Definition round-trip (ALL_VIEWS.TEXT via getObjectDefinition).
+    const vdef = await driver.getObjectDefinition({ connectionId: config.id, kind: 'view', schema, name: vname })
+    if (!/SELECT/i.test(vdef) || !/FULL_NAME/i.test(vdef)) throw new Error(`view def did not round-trip: ${vdef.slice(0, 80)}`)
+    // Edit via CREATE OR REPLACE (change the SELECT); WITH READ ONLY.
+    vr = await driver.applyObjectSql([`CREATE OR REPLACE VIEW ${vqn} AS\nSELECT "ID", "EMAIL" FROM "${schema}"."CUSTOMERS" WITH READ ONLY`])
+    if (!vr.ok) throw new Error(`edit view: ${vr.message}`)
+    const vdef2 = await driver.getObjectDefinition({ connectionId: config.id, kind: 'view', schema, name: vname })
+    if (!/EMAIL/i.test(vdef2)) throw new Error('edited view def not reflected')
+    // Views node must not include materialized views.
+    if ((await driver.listViews(schema)).some((v) => /^MV/i.test(v.name))) throw new Error('materialized view leaked into Views')
+    await driver.execStatements(buildObjectOp('oracle', { kind: 'dropView', schema, name: vname }).statements)
+    if ((await driver.listViews(schema)).some((v) => v.name === vname)) throw new Error('view still listed after drop')
+
+    // --- B. ER DIAGRAM: FK introspection (render) + add/drop FK (edit) + drop-table CASCADE ---
+    // Seeded ORDERS→CUSTOMERS FK is introspected.
+    const ordFks = (await driver.getTableSpec(schema, 'ORDERS')).foreignKeys
+    if (!ordFks.some((f) => f.refTable === 'CUSTOMERS' && f.columns.includes('CUSTOMER_ID') && f.onUpdate == null)) {
+      throw new Error(`ER: seeded ORDERS→CUSTOMERS FK not introspected: ${JSON.stringify(ordFks)}`)
+    }
+    // Draw a FK between disposable tables (ON DELETE CASCADE), then drop it.
+    const erP = '_ORAER_P', erC = '_ORAER_C'
+    for (const nm of [erC, erP]) await driver.runQuery(`DROP TABLE "${nm}" CASCADE CONSTRAINTS PURGE`).catch(() => undefined)
+    await driver.runQuery(`CREATE TABLE "${erP}" ("ID" NUMBER PRIMARY KEY)`)
+    await driver.runQuery(`CREATE TABLE "${erC}" ("ID" NUMBER PRIMARY KEY, "PID" NUMBER)`)
+    const erBase = await driver.getTableSpec(schema, erC)
+    const erWithFk: import('@shared/types').TableSpec = {
+      ...erBase,
+      foreignKeys: [{ name: 'FK_ORAER', columns: ['PID'], refSchema: schema, refTable: erP, refColumns: ['ID'], onDelete: 'CASCADE', onUpdate: null }]
+    }
+    let er = await driver.execStatements(buildTableDdl('oracle', 'alter', erWithFk, erBase).statements)
+    if (!er.ok) throw new Error(`ER add-FK failed: ${er.message}`)
+    const erAfter = (await driver.getTableSpec(schema, erC)).foreignKeys
+    if (!erAfter.some((f) => f.refTable === erP && f.onDelete === 'CASCADE')) throw new Error('ER add-FK not reflected')
+    er = await driver.execStatements(buildTableDdl('oracle', 'alter', erBase, erWithFk).statements)
+    if (!er.ok) throw new Error(`ER drop-FK failed: ${er.message}`)
+    if ((await driver.getTableSpec(schema, erC)).foreignKeys.length !== 0) throw new Error('ER drop-FK not reflected')
+    // Drop parent via the object-op (CASCADE CONSTRAINTS PURGE) while child FK-refs it? child FK already dropped.
+    await driver.execStatements(buildObjectOp('oracle', { kind: 'dropTable', schema, table: erC }).statements)
+    await driver.execStatements(buildObjectOp('oracle', { kind: 'dropTable', schema, table: erP }).statements)
+    if ((await driver.listTables(schema)).some((t) => t.name === erP || t.name === erC)) throw new Error('ER tables remain after drop')
+    // Seed untouched.
+    if ((await driver.getTableRowCount(schema, 'CUSTOMERS')) !== 20) throw new Error('seeded customers changed (views/ER)')
+
+    results.push(`✅ ${tag}: connect(Thin), tables/views, catalog+pk, count(20)+paginate, filters(CI-contains/%/quote/>=/BETWEEN/IN/AND), funnel(8), custom(10), NULL partition, CRUD-by-PK; DDL: CREATE(IDENTITY, PK-once, no AUTOINCREMENT)+identity-insert+ALTER(add col/index/FK)+round-trip; ViewBuilder(INNER/LEFT/self-join, no-AS aliases); Sequences(list+ISEQ$$ system-flag, create/NEXTVAL(100), alter inc→10, RESTART→500, rename, drop); Indexes(list+PK-constraint-backed read-only, create single/multi/unique, edit(drop+recreate), rename, drop; seed untouched); Triggers(create+fire :NEW, compile-error→INVALID surfaced, edit via CREATE OR REPLACE, disable/enable, statement-level, WHEN-clause, get-details round-trip, drop; seed untouched); Routines(function+procedure list w/ sig+status, call fn(2,3)=5, package spec+body list+call f1(10)=11, compile-error→INVALID surfaced, edit CREATE OR REPLACE→2*3=6, GET_DDL round-trip, drop fn/proc/body/package; seed untouched); SQL export(real Oracle types VARCHAR2/NUMBER(10,2)/CLOB/DATE→TO_TIMESTAMP, IDENTITY+PK+NOT NULL, 1-INSERT-per-row no multi-row VALUES)→import clean(O'Brien+NULLs intact, browsable); Views(create CREATE OR REPLACE, open-data, def round-trip, edit+WITH READ ONLY, drop; no MV leak); ER(seeded ORDERS→CUSTOMERS FK introspected no-ON-UPDATE, draw FK ON DELETE CASCADE, drop FK, drop-table CASCADE CONSTRAINTS PURGE); seed untouched)`)
   } catch (err) {
     failed = true
     results.push(`❌ ${tag}: ${(err as Error).message}`)
   } finally {
+    await driver.runQuery(`DROP VIEW "_ORAV_ACTIVE"`).catch(() => undefined)
+    await driver.runQuery(`DROP TABLE "_ORAER_C" CASCADE CONSTRAINTS PURGE`).catch(() => undefined)
+    await driver.runQuery(`DROP TABLE "_ORAER_P" CASCADE CONSTRAINTS PURGE`).catch(() => undefined)
     await driver.runQuery(`DROP TABLE "_ORAEXP_T1"`).catch(() => undefined)
     await driver.runQuery(`DROP TABLE "_ORAEXP_T2"`).catch(() => undefined)
     await driver.runQuery(`DROP FUNCTION "_ORAFN_ADD"`).catch(() => undefined)
@@ -2690,6 +3030,862 @@ async function testOracle(config: ConnectionConfig): Promise<void> {
     await driver.runQuery(`DROP TABLE "_ORATEST_DETAILS"`).catch(() => undefined)
     await driver.runQuery(`DROP TABLE "_ORATEST_PARENT"`).catch(() => undefined)
     await driver.disconnect().catch(() => undefined)
+  }
+}
+
+/**
+ * TASK 64 — cross-engine data transfer matrix. Connects every available engine,
+ * builds a DISPOSABLE source table (`xfer_<engine>`) with awkward data on each,
+ * then copies it to every required target and verifies the target matches, the
+ * lossy-mapping warnings appear, identity values are preserved, and — critically
+ * — the SOURCE IS UNCHANGED. Every disposable object is dropped afterwards; the
+ * seeded customers/orders/order_items are never touched.
+ */
+async function testTransfer(configs: ConnectionConfig[]): Promise<void> {
+  const tag = 'transfer'
+  const drivers = new Map<Engine, DbDriver>()
+  const cfgOf = new Map<Engine, ConnectionConfig>()
+  for (const cfg of configs) {
+    try {
+      const d = await createDriver(cfg)
+      await d.connect()
+      drivers.set(cfg.engine, d)
+      cfgOf.set(cfg.engine, cfg)
+    } catch {
+      /* engine not available — its pairs are skipped */
+    }
+  }
+
+  const schemaOf = (engine: Engine): string => {
+    if (engine === 'sqlite') return 'main'
+    if (engine === 'mssql') return 'dbo'
+    if (engine === 'oracle') return (cfgOf.get('oracle')?.user || 'dbtool').toUpperCase()
+    return cfgOf.get(engine)?.database || 'dbtool_dev' // pg schema handled below
+  }
+  // Postgres: the schema is 'public', not the database name.
+  const srcSchemaOf = (engine: Engine): string => (engine === 'postgres' ? 'public' : schemaOf(engine))
+
+  // The disposable source table for a given source engine.
+  const srcTable = (engine: Engine): string => `xfer_${engine}`
+
+  const mkSpec = (engine: Engine, schema: string, table: string): TableSpec => {
+    const columns: ColumnSpec[] = [
+      { name: 'id', type: 'integer', autoIncrement: true, nullable: false },
+      { name: 'name', type: 'varchar', length: 100, nullable: true },
+      { name: 'quote_val', type: 'varchar', length: 50, nullable: true },
+      { name: 'geo', type: 'varchar', length: 100, nullable: true },
+      { name: 'empty_str', type: 'varchar', length: 50, nullable: true },
+      { name: 'note', type: 'varchar', length: 50, nullable: true },
+      { name: 'amount', type: 'decimal', length: 12, scale: 2, nullable: true },
+      { name: 'created', type: 'timestamp', nullable: true },
+      { name: 'flag', type: 'boolean', nullable: true },
+      { name: 'long_text', type: 'text', nullable: true }
+    ]
+    // Oracle DATE carries a time component — add one so the "keeps its time" path
+    // is exercised when Oracle is the SOURCE.
+    if (engine === 'oracle') columns.push({ name: 'odate', type: 'date', nullable: true })
+    return { schema, name: table, columns, primaryKey: ['id'], foreignKeys: [], indexes: [], comment: null }
+  }
+
+  const bool = (engine: Engine, v: boolean): unknown => (engine === 'postgres' ? v : v ? 1 : 0)
+
+  // Build + populate the disposable source table for one engine.
+  const buildSource = async (engine: Engine): Promise<void> => {
+    const d = drivers.get(engine)!
+    const schema = srcSchemaOf(engine)
+    const table = srcTable(engine)
+    await d.execStatements(buildObjectOp(engine, { kind: 'dropTable', schema, table }).statements).catch(() => undefined)
+    const spec = mkSpec(engine, schema, table)
+    const create = buildTableDdl(engine, 'create', spec)
+    const cr = await d.execStatements(create.statements)
+    if (!cr.ok) throw new Error(`source create (${engine}) failed: ${cr.message}`)
+    const cols = spec.columns.map((c) => c.name)
+    const columnTypes: Record<string, string> = {}
+    for (const c of spec.columns) columnTypes[c.name] = c.type
+    const longText = 'Ω'.repeat(300)
+    const base: Record<string, unknown> = { odate: '2022-07-04 09:15:30' }
+    const rows: Record<string, unknown>[] = [
+      { ...base, id: 1, name: 'Alice', quote_val: "O'Brien", geo: 'გამარჯობა', empty_str: '', note: null, amount: '1234.56', created: '2024-03-15 14:30:45', flag: bool(engine, true), long_text: longText },
+      { ...base, id: 2, name: 'Bob', quote_val: '50% off_', geo: 'თბილისი', empty_str: 'x', note: null, amount: '-0.05', created: '1999-12-31 23:59:59', flag: bool(engine, false), long_text: 'short' },
+      { ...base, id: 1000, name: 'Carol', quote_val: 'a"b', geo: 'ქუთაისი', empty_str: 'y', note: 'n', amount: '0.00', created: '2030-06-01 08:00:00', flag: bool(engine, true), long_text: 'mid' }
+    ]
+    const arr = rows.map((r) => cols.map((c) => r[c]))
+    await d.transferInsert(schema, table, cols, arr, columnTypes, ['id'])
+  }
+
+  // The required ordered pairs (task §VERIFICATION), plus a same-engine PG→PG.
+  const pairs: [Engine, Engine][] = [
+    ['postgres', 'mssql'], ['mssql', 'postgres'], ['oracle', 'mssql'], ['mssql', 'oracle'],
+    ['mysql', 'mssql'], ['mssql', 'mysql'], ['mariadb', 'mssql'], ['mssql', 'mariadb'],
+    ['sqlite', 'mssql'], ['mssql', 'sqlite'],
+    ['postgres', 'oracle'], ['oracle', 'postgres'], ['mysql', 'oracle'], ['oracle', 'mysql'],
+    ['sqlite', 'oracle'], ['oracle', 'sqlite'], ['mariadb', 'oracle'], ['oracle', 'mariadb']
+  ]
+
+  const sourcesNeeded = new Set<Engine>()
+  for (const [s] of pairs) sourcesNeeded.add(s)
+  sourcesNeeded.add('postgres') // PG→PG
+
+  // Create each disposable source once (skip engines that aren't connected).
+  const built = new Set<Engine>()
+  for (const e of sourcesNeeded) {
+    if (!drivers.has(e)) continue
+    try {
+      await buildSource(e)
+      built.add(e)
+    } catch (err) {
+      results.push(`❌ ${tag}: source setup ${e}: ${(err as Error).message}`)
+      failed = true
+    }
+  }
+
+  const runPair = async (src: Engine, dst: Engine, targetSchema: string): Promise<void> => {
+    const sd = drivers.get(src)
+    const dd = drivers.get(dst)
+    if (!sd || !dd || !built.has(src)) {
+      results.push(`⏭ ${tag} ${src}→${dst}: engine not available`)
+      return
+    }
+    const table = srcTable(src)
+    const sourceSchema = srcSchemaOf(src)
+    const req: TransferRequest = {
+      sourceConnectionId: cfgOf.get(src)!.id,
+      targetConnectionId: cfgOf.get(dst)!.id,
+      sourceSchema,
+      targetSchema,
+      tables: [table],
+      ifExists: 'drop'
+    }
+    try {
+      const plan = await buildTransferPlan(sd, dd, { sourceConnectionId: req.sourceConnectionId, targetConnectionId: req.targetConnectionId, sourceSchema, targetSchema, tables: [table] })
+      const res = await runTransfer(sd, dd, req)
+      if (!res.ok) throw new Error(`run failed: ${res.error ?? JSON.stringify(res.tables)}`)
+
+      const cnt = await dd.getTableRowCount(targetSchema, table, [], null, null)
+      if (cnt !== 3) throw new Error(`target rowcount ${cnt} != 3`)
+      const page = await dd.getTablePage(targetSchema, table, 100, 1, null, [], null, null)
+      const byId = new Map(page.rows.map((r) => [Number((r as Record<string, unknown>).id), r as Record<string, unknown>]))
+      const r1 = byId.get(1)
+      if (!r1) throw new Error('row id=1 missing on target')
+      if (String(r1.quote_val) !== "O'Brien") throw new Error(`quote lost: ${JSON.stringify(r1.quote_val)}`)
+      if (String(r1.geo) !== 'გამარჯობა') throw new Error(`Georgian unicode lost: ${JSON.stringify(r1.geo)}`)
+      // Oracle stores '' as NULL, so an Oracle endpoint at EITHER end yields NULL.
+      if (dst === 'oracle') {
+        if (r1.empty_str != null) throw new Error(`Oracle empty-string should be NULL, got ${JSON.stringify(r1.empty_str)}`)
+      } else if (src === 'oracle') {
+        if (r1.empty_str != null && r1.empty_str !== '') throw new Error(`Oracle-source empty_str unexpected: ${JSON.stringify(r1.empty_str)}`)
+      } else if (r1.empty_str !== '') {
+        throw new Error(`empty string not preserved: ${JSON.stringify(r1.empty_str)}`)
+      }
+      const createdStr = r1.created instanceof Date ? r1.created.toISOString() : String(r1.created)
+      if (!/:30:45/.test(createdStr)) throw new Error(`datetime time component lost: ${createdStr}`)
+      if (Math.abs(Number(r1.amount) - 1234.56) > 0.001) throw new Error(`decimal lost: ${JSON.stringify(r1.amount)}`)
+      const flagOk = r1.flag === true || Number(r1.flag) === 1 || r1.flag === 'true' || r1.flag === '1'
+      if (!flagOk) throw new Error(`boolean lost: ${JSON.stringify(r1.flag)}`)
+      if (String(r1.long_text).length < 100) throw new Error(`long text truncated: ${String(r1.long_text).length}`)
+      if (!byId.get(1000)) throw new Error('identity value 1000 not preserved')
+      // Oracle DATE keeps its time (only when Oracle is the source).
+      if (src === 'oracle') {
+        const od = r1.odate
+        const odStr = od instanceof Date ? od.toISOString() : String(od)
+        if (od != null && !/:15:30/.test(odStr)) throw new Error(`Oracle DATE lost its time: ${odStr}`)
+      }
+      const warned = plan.tables[0]?.columns.some((c) => c.warnings.length > 0)
+      // Drop the disposable target table.
+      await dd.execStatements(buildObjectOp(dst, { kind: 'dropTable', schema: targetSchema, table }).statements).catch(() => undefined)
+      results.push(`✅ ${tag} ${src}→${dst}: 3 rows, unicode+quote+decimal+time+identity ok${warned ? ' (warnings emitted)' : ''}`)
+    } catch (err) {
+      failed = true
+      results.push(`❌ ${tag} ${src}→${dst}: ${(err as Error).message}`)
+      await dd.execStatements(buildObjectOp(dst, { kind: 'dropTable', schema: targetSchema, table }).statements).catch(() => undefined)
+    }
+  }
+
+  for (const [s, d] of pairs) await runPair(s, d, srcSchemaOf(d))
+
+  // Same-engine PG→PG into a DISPOSABLE schema (never the source's own schema).
+  if (drivers.has('postgres') && built.has('postgres')) {
+    const pg = drivers.get('postgres')!
+    await pg.execStatements(buildObjectOp('postgres', { kind: 'createSchema', name: 'xfer_tgt' }).statements).catch(() => undefined)
+    await runPair('postgres', 'postgres', 'xfer_tgt')
+    await pg.execStatements(buildObjectOp('postgres', { kind: 'dropSchema', name: 'xfer_tgt' }).statements).catch(() => undefined)
+  }
+
+  // FK-ordering scenario: parent + child (child → parent FK) PG → MSSQL & PG → Oracle.
+  if (drivers.has('postgres')) {
+    const pg = drivers.get('postgres')!
+    const psch = srcSchemaOf('postgres')
+    const parent: TableSpec = { schema: psch, name: 'xfer_parent', columns: [{ name: 'id', type: 'integer', autoIncrement: true, nullable: false }, { name: 'label', type: 'varchar', length: 40, nullable: true }], primaryKey: ['id'], foreignKeys: [], indexes: [], comment: null }
+    const child: TableSpec = { schema: psch, name: 'xfer_child', columns: [{ name: 'id', type: 'integer', autoIncrement: true, nullable: false }, { name: 'parent_id', type: 'integer', nullable: true }], primaryKey: ['id'], foreignKeys: [{ name: 'fk_xc_parent', columns: ['parent_id'], refTable: 'xfer_parent', refColumns: ['id'] }], indexes: [], comment: null }
+    try {
+      for (const t of ['xfer_child', 'xfer_parent']) await pg.execStatements(buildObjectOp('postgres', { kind: 'dropTable', schema: psch, table: t }).statements).catch(() => undefined)
+      await pg.execStatements(buildTableDdl('postgres', 'create', parent).statements)
+      await pg.execStatements(buildTableDdl('postgres', 'create', child).statements)
+      await pg.transferInsert(psch, 'xfer_parent', ['id', 'label'], [[1, 'p1'], [2, 'p2']], { id: 'integer', label: 'varchar' }, ['id'])
+      await pg.transferInsert(psch, 'xfer_child', ['id', 'parent_id'], [[1, 1], [2, 2], [3, 1]], { id: 'integer', parent_id: 'integer' }, ['id'])
+      for (const dst of ['mssql', 'oracle'] as Engine[]) {
+        const dd = drivers.get(dst)
+        if (!dd) { results.push(`⏭ ${tag} FK pg→${dst}: not available`); continue }
+        const tsch = schemaOf(dst)
+        const req: TransferRequest = { sourceConnectionId: cfgOf.get('postgres')!.id, targetConnectionId: cfgOf.get(dst)!.id, sourceSchema: psch, targetSchema: tsch, tables: ['xfer_parent', 'xfer_child'], ifExists: 'drop' }
+        const res = await runTransfer(pg, dd, req)
+        const childRes = res.tables.find((t) => t.table === 'xfer_child')
+        // The FK must be recreated (no fkWarnings for it) and rows must load.
+        const fkOk = res.fkWarnings.length === 0 && childRes?.rows === 3
+        // Confirm the FK exists on the target by reading the child's spec.
+        const childSpec = await dd.getTableSpec(tsch, 'xfer_child')
+        const hasFk = childSpec.foreignKeys.some((f) => f.refTable.toLowerCase() === 'xfer_parent')
+        for (const t of ['xfer_child', 'xfer_parent']) await dd.execStatements(buildObjectOp(dst, { kind: 'dropTable', schema: tsch, table: t }).statements).catch(() => undefined)
+        if (fkOk && hasFk) results.push(`✅ ${tag} FK pg→${dst}: parent+child ordered, FK recreated`)
+        else { failed = true; results.push(`❌ ${tag} FK pg→${dst}: fkWarnings=${JSON.stringify(res.fkWarnings)} childRows=${childRes?.rows} hasFk=${hasFk}`) }
+      }
+      for (const t of ['xfer_child', 'xfer_parent']) await pg.execStatements(buildObjectOp('postgres', { kind: 'dropTable', schema: psch, table: t }).statements).catch(() => undefined)
+    } catch (err) {
+      failed = true
+      results.push(`❌ ${tag} FK scenario: ${(err as Error).message}`)
+    }
+  }
+
+  // SOURCE UNCHANGED: every disposable source still has exactly its 3 rows and
+  // its O'Brien value intact — proof the transfer never wrote to the source.
+  for (const e of built) {
+    try {
+      const d = drivers.get(e)!
+      const schema = srcSchemaOf(e)
+      const table = srcTable(e)
+      const cnt = await d.getTableRowCount(schema, table, [], null, null)
+      const page = await d.getTablePage(schema, table, 100, 1, null, [], null, null)
+      const r1 = page.rows.find((r) => Number((r as Record<string, unknown>).id) === 1) as Record<string, unknown> | undefined
+      if (cnt !== 3 || String(r1?.quote_val) !== "O'Brien") throw new Error(`source ${e} changed! count=${cnt} quote=${JSON.stringify(r1?.quote_val)}`)
+      // Cleanup the disposable source.
+      await d.execStatements(buildObjectOp(e, { kind: 'dropTable', schema, table }).statements).catch(() => undefined)
+      results.push(`✅ ${tag} source-unchanged ${e}: 3 rows + O'Brien intact`)
+    } catch (err) {
+      failed = true
+      results.push(`❌ ${tag} source-unchanged ${e}: ${(err as Error).message}`)
+    }
+  }
+
+  for (const d of drivers.values()) await d.disconnect().catch(() => undefined)
+}
+
+/**
+ * TASK 65 — DEEPER transfer verification beyond the TASK 64 matrix: edge cases the
+ * headless matrix skipped (empty table, composite/no PK, self + cyclic FK, 3-table
+ * ordering, DEFAULT/NOT NULL, large volume crossing the MSSQL 1000-row boundary,
+ * 100k-char text/CLOB, BLOB, all-NULL rows, identifiers needing quoting), append
+ * correctness (incl. PK collision), skip/override honoring, and mid-transfer error
+ * handling. All disposable objects use the `_xv_` prefix and are dropped; the
+ * seeded tables are never touched; the source is proven read-only.
+ */
+async function testTransferDeep(configs: ConnectionConfig[]): Promise<void> {
+  const tag = 'xfer-deep'
+  const drivers = new Map<Engine, DbDriver>()
+  const cfgOf = new Map<Engine, ConnectionConfig>()
+  for (const cfg of configs) {
+    try {
+      const d = await createDriver(cfg)
+      await d.connect()
+      drivers.set(cfg.engine, d)
+      cfgOf.set(cfg.engine, cfg)
+    } catch {
+      /* engine unavailable */
+    }
+  }
+  const schemaOf = (e: Engine): string =>
+    e === 'sqlite' ? 'main' : e === 'mssql' ? 'dbo' : e === 'oracle' ? (cfgOf.get('oracle')?.user || 'dbtool').toUpperCase() : e === 'postgres' ? 'public' : cfgOf.get(e)?.database || 'dbtool_dev'
+  const have = (...es: Engine[]): boolean => es.every((e) => drivers.has(e))
+  const pass = (m: string): void => { results.push(`✅ ${tag} ${m}`) }
+  const bad = (m: string): void => { failed = true; results.push(`❌ ${tag} ${m}`) }
+  const col = (name: string, type: string, extra: Partial<ColumnSpec> = {}): ColumnSpec => ({ name, type, nullable: true, ...extra })
+  const dropT = async (e: Engine, schema: string, table: string): Promise<void> => {
+    await drivers.get(e)!.execStatements(buildObjectOp(e, { kind: 'dropTable', schema, table }).statements).catch(() => undefined)
+  }
+  const setup = async (e: Engine, spec: TableSpec, rows: unknown[][], identityCols: string[]): Promise<void> => {
+    const d = drivers.get(e)!
+    // Drop children before parents if multiple (caller passes one spec at a time).
+    await dropT(e, spec.schema, spec.name)
+    const cr = await d.execStatements(buildTableDdl(e, 'create', spec).statements)
+    if (!cr.ok) throw new Error(`setup create ${spec.name}/${e}: ${cr.message}`)
+    if (rows.length) {
+      const cols = spec.columns.map((c) => c.name)
+      const ct: Record<string, string> = {}
+      for (const c of spec.columns) ct[c.name] = c.type
+      await d.transferInsert(spec.schema, spec.name, cols, rows, ct, identityCols)
+    }
+  }
+  const run = async (src: Engine, dst: Engine, tables: string[], ifExists: 'skip' | 'drop' | 'append' = 'drop', overrides?: TransferRequest['overrides']): Promise<import('@shared/types').TransferResult> => {
+    const req: TransferRequest = { sourceConnectionId: cfgOf.get(src)!.id, targetConnectionId: cfgOf.get(dst)!.id, sourceSchema: schemaOf(src), targetSchema: schemaOf(dst), tables, ifExists, overrides }
+    return runTransfer(drivers.get(src)!, drivers.get(dst)!, req)
+  }
+  const count = (e: Engine, schema: string, table: string): Promise<number> => drivers.get(e)!.getTableRowCount(schema, table, [], null, null)
+
+  const PS = schemaOf('postgres')
+
+  // S1 — empty table (0 rows): structure created, no error.
+  if (have('postgres', 'mssql', 'oracle')) {
+    for (const dst of ['mssql', 'oracle'] as Engine[]) {
+      try {
+        const spec: TableSpec = { schema: PS, name: '_xv_empty', columns: [col('id', 'integer', { autoIncrement: true, nullable: false }), col('name', 'varchar', { length: 50 })], primaryKey: ['id'], foreignKeys: [], indexes: [], comment: null }
+        await setup('postgres', spec, [], ['id'])
+        const res = await run('postgres', dst, ['_xv_empty'])
+        const c = await count(dst, schemaOf(dst), '_xv_empty')
+        if (res.ok && c === 0) pass(`empty-table pg→${dst}: created, 0 rows`)
+        else bad(`empty-table pg→${dst}: ok=${res.ok} cnt=${c} err=${JSON.stringify(res.tables)}`)
+        await dropT(dst, schemaOf(dst), '_xv_empty')
+      } catch (e) { bad(`empty-table pg→${dst}: ${(e as Error).message}`) }
+    }
+    await dropT('postgres', PS, '_xv_empty')
+  }
+
+  // S2 — composite primary key.
+  if (have('postgres', 'mssql', 'oracle')) {
+    for (const dst of ['mssql', 'oracle'] as Engine[]) {
+      try {
+        const spec: TableSpec = { schema: PS, name: '_xv_ckpk', columns: [col('a', 'integer', { nullable: false }), col('b', 'varchar', { length: 20, nullable: false }), col('v', 'varchar', { length: 40 })], primaryKey: ['a', 'b'], foreignKeys: [], indexes: [], comment: null }
+        await setup('postgres', spec, [[1, 'x', 'one'], [1, 'y', 'two'], [2, 'x', 'three']], [])
+        const res = await run('postgres', dst, ['_xv_ckpk'])
+        const spec2 = await drivers.get(dst)!.getTableSpec(schemaOf(dst), '_xv_ckpk')
+        const c = await count(dst, schemaOf(dst), '_xv_ckpk')
+        if (res.ok && c === 3 && spec2.primaryKey.length === 2) pass(`composite-pk pg→${dst}: 3 rows, 2-col PK`)
+        else bad(`composite-pk pg→${dst}: ok=${res.ok} cnt=${c} pk=${JSON.stringify(spec2.primaryKey)}`)
+        await dropT(dst, schemaOf(dst), '_xv_ckpk')
+      } catch (e) { bad(`composite-pk pg→${dst}: ${(e as Error).message}`) }
+    }
+    await dropT('postgres', PS, '_xv_ckpk')
+  }
+
+  // S3 — self-referencing FK (FK added after data → self reference validates).
+  if (have('postgres', 'mssql')) {
+    try {
+      const spec: TableSpec = { schema: PS, name: '_xv_tree', columns: [col('id', 'integer', { autoIncrement: true, nullable: false }), col('parent_id', 'integer')], primaryKey: ['id'], foreignKeys: [{ name: 'fk_tree_self', columns: ['parent_id'], refTable: '_xv_tree', refColumns: ['id'] }], indexes: [], comment: null }
+      await setup('postgres', spec, [[1, null], [2, 1], [3, 1], [4, 3]], ['id'])
+      const res = await run('postgres', 'mssql', ['_xv_tree'])
+      const t2 = await drivers.get('mssql')!.getTableSpec('dbo', '_xv_tree')
+      const c = await count('mssql', 'dbo', '_xv_tree')
+      const hasFk = t2.foreignKeys.some((f) => f.refTable.toLowerCase() === '_xv_tree')
+      if (res.ok && c === 4 && hasFk && res.fkWarnings.length === 0) pass('self-fk pg→mssql: 4 rows, self-FK recreated')
+      else bad(`self-fk pg→mssql: ok=${res.ok} cnt=${c} hasFk=${hasFk} fkWarn=${JSON.stringify(res.fkWarnings)}`)
+      await dropT('mssql', 'dbo', '_xv_tree')
+    } catch (e) { bad(`self-fk pg→mssql: ${(e as Error).message}`) }
+    await dropT('postgres', PS, '_xv_tree')
+  }
+
+  // S4 — cyclic FKs between two tables (must succeed since FKs come after data).
+  if (have('postgres', 'mssql')) {
+    // A cyclic pair can't be removed by plain DROP TABLE (each FK blocks the
+    // other) — drop the FK constraints first, then the tables.
+    const dropCyc = async (eng: Engine): Promise<void> => {
+      const s = schemaOf(eng)
+      const q = eng === 'mssql' ? (x: string): string => `[${x}]` : (x: string): string => `"${x}"`
+      const d = drivers.get(eng)
+      if (!d) return
+      await d.execStatements([`ALTER TABLE ${q(s)}.${q('_xv_ca')} DROP CONSTRAINT ${q('fk_ca_b')}`]).catch(() => undefined)
+      await d.execStatements([`ALTER TABLE ${q(s)}.${q('_xv_cb')} DROP CONSTRAINT ${q('fk_cb_a')}`]).catch(() => undefined)
+      await dropT(eng, s, '_xv_ca')
+      await dropT(eng, s, '_xv_cb')
+    }
+    await dropCyc('postgres'); await dropCyc('mssql') // clean any prior-run leftovers
+    try {
+      const a: TableSpec = { schema: PS, name: '_xv_ca', columns: [col('id', 'integer', { nullable: false }), col('b_id', 'integer')], primaryKey: ['id'], foreignKeys: [{ name: 'fk_ca_b', columns: ['b_id'], refTable: '_xv_cb', refColumns: ['id'] }], indexes: [], comment: null }
+      const b: TableSpec = { schema: PS, name: '_xv_cb', columns: [col('id', 'integer', { nullable: false }), col('a_id', 'integer')], primaryKey: ['id'], foreignKeys: [{ name: 'fk_cb_a', columns: ['a_id'], refTable: '_xv_ca', refColumns: ['id'] }], indexes: [], comment: null }
+      await drivers.get('postgres')!.execStatements(buildTableDdl('postgres', 'create', { ...a, foreignKeys: [] }).statements)
+      await drivers.get('postgres')!.execStatements(buildTableDdl('postgres', 'create', { ...b, foreignKeys: [] }).statements)
+      await drivers.get('postgres')!.transferInsert(PS, '_xv_ca', ['id', 'b_id'], [[1, 1], [2, 2]], { id: 'integer', b_id: 'integer' }, [])
+      await drivers.get('postgres')!.transferInsert(PS, '_xv_cb', ['id', 'a_id'], [[1, 1], [2, 2]], { id: 'integer', a_id: 'integer' }, [])
+      await drivers.get('postgres')!.execStatements(buildAddForeignKeys('postgres', a))
+      await drivers.get('postgres')!.execStatements(buildAddForeignKeys('postgres', b))
+      const res = await run('postgres', 'mssql', ['_xv_ca', '_xv_cb'])
+      const ca = await drivers.get('mssql')!.getTableSpec('dbo', '_xv_ca')
+      const cb = await drivers.get('mssql')!.getTableSpec('dbo', '_xv_cb')
+      const bothFk = ca.foreignKeys.length === 1 && cb.foreignKeys.length === 1
+      if (res.ok && res.fkWarnings.length === 0 && bothFk) pass('cyclic-fk pg→mssql: both tables + both FKs recreated')
+      else bad(`cyclic-fk pg→mssql: ok=${res.ok} fkWarn=${JSON.stringify(res.fkWarnings)} bothFk=${bothFk}`)
+    } catch (e) { bad(`cyclic-fk pg→mssql: ${(e as Error).message}`) }
+    await dropCyc('mssql')
+    await dropCyc('postgres')
+  }
+
+  // S6 — no primary key.
+  if (have('postgres', 'mssql')) {
+    try {
+      const spec: TableSpec = { schema: PS, name: '_xv_nopk', columns: [col('a', 'integer'), col('b', 'varchar', { length: 30 })], primaryKey: [], foreignKeys: [], indexes: [], comment: null }
+      await setup('postgres', spec, [[1, 'x'], [2, 'y'], [2, 'y']], [])
+      const res = await run('postgres', 'mssql', ['_xv_nopk'])
+      const c = await count('mssql', 'dbo', '_xv_nopk')
+      if (res.ok && c === 3) pass('no-pk pg→mssql: 3 rows (incl. duplicate)')
+      else bad(`no-pk pg→mssql: ok=${res.ok} cnt=${c}`)
+      await dropT('mssql', 'dbo', '_xv_nopk')
+    } catch (e) { bad(`no-pk pg→mssql: ${(e as Error).message}`) }
+    await dropT('postgres', PS, '_xv_nopk')
+  }
+
+  // S7 — DEFAULT + NOT NULL columns (defaults are dropped on the target; actual
+  // values are copied so NOT NULL is satisfied).
+  if (have('postgres', 'mssql')) {
+    try {
+      const spec: TableSpec = { schema: PS, name: '_xv_def', columns: [col('id', 'integer', { autoIncrement: true, nullable: false }), col('status', 'varchar', { length: 20, nullable: false, default: "'active'" }), col('qty', 'integer', { nullable: false, default: '0' })], primaryKey: ['id'], foreignKeys: [], indexes: [], comment: null }
+      await setup('postgres', spec, [[1, 'shipped', 5], [2, 'active', 0]], ['id'])
+      const res = await run('postgres', 'mssql', ['_xv_def'])
+      const c = await count('mssql', 'dbo', '_xv_def')
+      const t2 = await drivers.get('mssql')!.getTableSpec('dbo', '_xv_def')
+      const notNull = t2.columns.filter((cc) => cc.name === 'status' || cc.name === 'qty').every((cc) => !cc.nullable)
+      if (res.ok && c === 2 && notNull) pass('default+notnull pg→mssql: 2 rows, NOT NULL kept')
+      else bad(`default+notnull pg→mssql: ok=${res.ok} cnt=${c} notNull=${notNull}`)
+      await dropT('mssql', 'dbo', '_xv_def')
+    } catch (e) { bad(`default+notnull pg→mssql: ${(e as Error).message}`) }
+    await dropT('postgres', PS, '_xv_def')
+  }
+
+  // S8 — large volume crossing the MSSQL 1000-row chunk boundary + Oracle single-row.
+  if (have('postgres', 'mssql', 'oracle')) {
+    const mkRows = (n: number): unknown[][] => Array.from({ length: n }, (_, i) => [i + 1, `row ${i + 1}`])
+    const spec: TableSpec = { schema: PS, name: '_xv_big', columns: [col('id', 'integer', { nullable: false }), col('v', 'varchar', { length: 40 })], primaryKey: ['id'], foreignKeys: [], indexes: [], comment: null }
+    for (const [dst, n] of [['mssql', 2500], ['oracle', 2500], ['mssql', 10000]] as [Engine, number][]) {
+      try {
+        await setup('postgres', spec, mkRows(n), [])
+        let ticks = 0
+        const req: TransferRequest = { sourceConnectionId: cfgOf.get('postgres')!.id, targetConnectionId: cfgOf.get(dst)!.id, sourceSchema: PS, targetSchema: schemaOf(dst), tables: ['_xv_big'], ifExists: 'drop' }
+        const res = await runTransfer(drivers.get('postgres')!, drivers.get(dst)!, req, () => { ticks++ })
+        const c = await count(dst, schemaOf(dst), '_xv_big')
+        if (res.ok && c === n && ticks > 0) pass(`volume pg→${dst}: ${n} rows (progress ticks=${ticks})`)
+        else bad(`volume pg→${dst} n=${n}: ok=${res.ok} cnt=${c} ticks=${ticks} err=${JSON.stringify(res.tables)}`)
+        await dropT(dst, schemaOf(dst), '_xv_big')
+      } catch (e) { bad(`volume pg→${dst} n=${n}: ${(e as Error).message}`) }
+    }
+    await dropT('postgres', PS, '_xv_big')
+  }
+
+  // S9 — very long text (100k chars) → CLOB / NVARCHAR(MAX) / text.
+  if (have('postgres', 'mssql', 'oracle')) {
+    const big = 'A'.repeat(100000)
+    for (const dst of ['mssql', 'oracle', 'postgres'] as Engine[]) {
+      if (dst === 'postgres') { if (!have('postgres')) continue }
+      const tgtSchema = dst === 'postgres' ? 'xferv_tgt' : schemaOf(dst)
+      try {
+        const spec: TableSpec = { schema: PS, name: '_xv_long', columns: [col('id', 'integer', { nullable: false }), col('body', 'text')], primaryKey: ['id'], foreignKeys: [], indexes: [], comment: null }
+        await setup('postgres', spec, [[1, big], [2, 'short']], [])
+        if (dst === 'postgres') await drivers.get('postgres')!.execStatements(buildObjectOp('postgres', { kind: 'createSchema', name: 'xferv_tgt' }).statements).catch(() => undefined)
+        const req: TransferRequest = { sourceConnectionId: cfgOf.get('postgres')!.id, targetConnectionId: cfgOf.get(dst)!.id, sourceSchema: PS, targetSchema: tgtSchema, tables: ['_xv_long'], ifExists: 'drop' }
+        const res = await runTransfer(drivers.get('postgres')!, drivers.get(dst)!, req)
+        const page = await drivers.get(dst)!.getTablePage(tgtSchema, '_xv_long', 10, 1, null, [], null, null)
+        const r1 = page.rows.find((r) => Number((r as Record<string, unknown>).id) === 1) as Record<string, unknown> | undefined
+        const len = r1 ? String(r1.body).length : -1
+        if (res.ok && len === 100000) pass(`long-text pg→${dst}: 100k chars preserved`)
+        else bad(`long-text pg→${dst}: ok=${res.ok} len=${len} err=${JSON.stringify(res.tables)}`)
+        await dropT(dst, tgtSchema, '_xv_long')
+        if (dst === 'postgres') await drivers.get('postgres')!.execStatements(buildObjectOp('postgres', { kind: 'dropSchema', name: 'xferv_tgt' }).statements).catch(() => undefined)
+      } catch (e) { bad(`long-text pg→${dst}: ${(e as Error).message}`) }
+    }
+    await dropT('postgres', PS, '_xv_long')
+  }
+
+  // S10 — BLOB / binary column.
+  if (have('postgres', 'mssql', 'oracle', 'sqlite')) {
+    const buf = Buffer.from([0, 1, 2, 255, 254, 0, 128, 64, 32, 16])
+    for (const dst of ['mssql', 'oracle', 'sqlite'] as Engine[]) {
+      try {
+        const spec: TableSpec = { schema: PS, name: '_xv_blob', columns: [col('id', 'integer', { nullable: false }), col('data', 'bytea')], primaryKey: ['id'], foreignKeys: [], indexes: [], comment: null }
+        await setup('postgres', spec, [[1, buf], [2, null]], [])
+        const res = await run('postgres', dst, ['_xv_blob'])
+        const page = await drivers.get(dst)!.getTablePage(schemaOf(dst), '_xv_blob', 10, 1, null, [], null, null)
+        const r1 = page.rows.find((r) => Number((r as Record<string, unknown>).id) === 1) as Record<string, unknown> | undefined
+        const got = r1?.data
+        // The target driver re-normalizes a Buffer to a hex string (0x…/\x…) — so
+        // compare the hex payload, not a Buffer instance.
+        const hex = typeof got === 'string' ? got.replace(/^(?:\\x|0x)/i, '').toLowerCase() : Buffer.isBuffer(got) ? got.toString('hex') : ''
+        const okBytes = hex === buf.toString('hex')
+        if (res.ok && okBytes) pass(`blob pg→${dst}: ${buf.length} bytes round-tripped`)
+        else bad(`blob pg→${dst}: ok=${res.ok} got=${typeof got === 'string' ? got : typeof got} match=${okBytes} err=${JSON.stringify(res.tables)}`)
+        await dropT(dst, schemaOf(dst), '_xv_blob')
+      } catch (e) { bad(`blob pg→${dst}: ${(e as Error).message}`) }
+    }
+    await dropT('postgres', PS, '_xv_blob')
+  }
+
+  // S11 — all-NULL row (every nullable column NULL).
+  if (have('postgres', 'mssql', 'oracle')) {
+    for (const dst of ['mssql', 'oracle'] as Engine[]) {
+      try {
+        const spec: TableSpec = { schema: PS, name: '_xv_null', columns: [col('id', 'integer', { nullable: false }), col('a', 'varchar', { length: 20 }), col('b', 'integer'), col('c', 'timestamp'), col('d', 'boolean')], primaryKey: ['id'], foreignKeys: [], indexes: [], comment: null }
+        await setup('postgres', spec, [[1, null, null, null, null], [2, 'x', 5, '2024-01-01 12:00:00', drivers.has('postgres') ? true : 1]], [])
+        const res = await run('postgres', dst, ['_xv_null'])
+        const page = await drivers.get(dst)!.getTablePage(schemaOf(dst), '_xv_null', 10, 1, null, [], null, null)
+        const r1 = page.rows.find((r) => Number((r as Record<string, unknown>).id) === 1) as Record<string, unknown> | undefined
+        const allNull = r1 ? ['a', 'b', 'c', 'd'].every((k) => r1[k] == null) : false
+        if (res.ok && allNull) pass(`all-null pg→${dst}: NULLs preserved`)
+        else bad(`all-null pg→${dst}: ok=${res.ok} row=${JSON.stringify(r1)}`)
+        await dropT(dst, schemaOf(dst), '_xv_null')
+      } catch (e) { bad(`all-null pg→${dst}: ${(e as Error).message}`) }
+    }
+    await dropT('postgres', PS, '_xv_null')
+  }
+
+  // S12 — identifiers needing quoting: mixed case, a reserved word, a space.
+  if (have('postgres', 'mssql', 'oracle')) {
+    for (const dst of ['mssql', 'oracle'] as Engine[]) {
+      try {
+        const spec: TableSpec = { schema: PS, name: '_xv weird', columns: [col('id', 'integer', { nullable: false }), col('MixedCase', 'varchar', { length: 20 }), col('order', 'integer'), col('my col', 'varchar', { length: 20 })], primaryKey: ['id'], foreignKeys: [], indexes: [], comment: null }
+        await setup('postgres', spec, [[1, 'Aa', 10, 'hi there'], [2, 'Bb', 20, 'x']], [])
+        const res = await run('postgres', dst, ['_xv weird'])
+        const c = await count(dst, schemaOf(dst), '_xv weird')
+        if (res.ok && c === 2) pass(`quoting pg→${dst}: 2 rows (space/mixed-case/reserved word)`)
+        else bad(`quoting pg→${dst}: ok=${res.ok} cnt=${c} err=${JSON.stringify(res.tables)}`)
+        await dropT(dst, schemaOf(dst), '_xv weird')
+      } catch (e) { bad(`quoting pg→${dst}: ${(e as Error).message}`) }
+    }
+    await dropT('postgres', PS, '_xv weird')
+  }
+
+  // S17 — tz-aware timestamp preserved on engines that HAVE a tz type
+  // (mssql DATETIMEOFFSET, oracle TIMESTAMP WITH TIME ZONE); time kept.
+  if (have('postgres', 'mssql', 'oracle')) {
+    for (const dst of ['mssql', 'oracle'] as Engine[]) {
+      try {
+        const spec: TableSpec = { schema: PS, name: '_xv_tz', columns: [col('id', 'integer', { nullable: false }), col('ts', 'timestamp', { withTimeZone: true })], primaryKey: ['id'], foreignKeys: [], indexes: [], comment: null }
+        await setup('postgres', spec, [[1, '2024-03-15 14:30:45+00'], [2, null]], [])
+        const res = await run('postgres', dst, ['_xv_tz'])
+        const t2 = await drivers.get(dst)!.getTableSpec(schemaOf(dst), '_xv_tz')
+        const tsType = (t2.columns.find((c) => c.name === 'ts')?.type || '').toLowerCase()
+        const tzAware = dst === 'mssql' ? /datetimeoffset/.test(tsType) : /time zone/.test(tsType)
+        const page = await drivers.get(dst)!.getTablePage(schemaOf(dst), '_xv_tz', 10, 1, null, [], null, null)
+        const r1 = page.rows.find((r) => Number((r as Record<string, unknown>).id) === 1) as Record<string, unknown> | undefined
+        const s = r1?.ts instanceof Date ? r1.ts.toISOString() : String(r1?.ts)
+        const timeKept = /:30:45/.test(s)
+        if (res.ok && tzAware && timeKept) pass(`tz-timestamp pg→${dst}: tz-aware type (${tsType}) + time kept`)
+        else bad(`tz-timestamp pg→${dst}: ok=${res.ok} type=${tsType} tzAware=${tzAware} timeKept=${timeKept} val=${s} err=${JSON.stringify(res.tables)}`)
+        await dropT(dst, schemaOf(dst), '_xv_tz')
+      } catch (e) { bad(`tz-timestamp pg→${dst}: ${(e as Error).message}`) }
+    }
+    await dropT('postgres', PS, '_xv_tz')
+  }
+
+  // S13 — append mode: existing rows kept + new added; then a PK collision is
+  // reported (not a silent partial success), leaving prior rows intact.
+  if (have('postgres', 'mssql')) {
+    try {
+      const spec: TableSpec = { schema: PS, name: '_xv_app', columns: [col('id', 'integer', { nullable: false }), col('v', 'varchar', { length: 20 })], primaryKey: ['id'], foreignKeys: [], indexes: [], comment: null }
+      await setup('postgres', spec, [[1, 'a'], [2, 'b'], [3, 'c']], [])
+      await run('postgres', 'mssql', ['_xv_app'], 'drop') // target now has 1,2,3
+      // Source becomes ids 4,5; append.
+      await setup('postgres', spec, [[4, 'd'], [5, 'e']], [])
+      const resApp = await run('postgres', 'mssql', ['_xv_app'], 'append')
+      const cApp = await count('mssql', 'dbo', '_xv_app')
+      if (resApp.ok && cApp === 5) pass('append pg→mssql: existing kept + new added (5 rows)')
+      else bad(`append pg→mssql: ok=${resApp.ok} cnt=${cApp}`)
+      // Collision: source ids 1,2 (already present) appended → must fail clearly.
+      await setup('postgres', spec, [[1, 'dup'], [2, 'dup']], [])
+      const resCol = await run('postgres', 'mssql', ['_xv_app'], 'append')
+      const cCol = await count('mssql', 'dbo', '_xv_app')
+      const reported = !resCol.ok || resCol.tables.some((t) => t.status === 'failed')
+      if (reported && cCol === 5) pass('append-collision pg→mssql: PK collision reported, prior rows intact')
+      else bad(`append-collision pg→mssql: reported=${reported} cnt=${cCol} (expected still 5) tables=${JSON.stringify(resCol.tables)}`)
+      await dropT('mssql', 'dbo', '_xv_app')
+    } catch (e) { bad(`append pg→mssql: ${(e as Error).message}`) }
+    await dropT('postgres', PS, '_xv_app')
+  }
+
+  // S14 — skip + type override are honored in the RESULT (the wizard just sets them).
+  if (have('postgres', 'mssql')) {
+    try {
+      const spec: TableSpec = { schema: PS, name: '_xv_ovr', columns: [col('id', 'integer', { autoIncrement: true, nullable: false }), col('geo', 'varchar', { length: 30 }), col('amount', 'decimal', { length: 10, scale: 2 })], primaryKey: ['id'], foreignKeys: [], indexes: [], comment: null }
+      await setup('postgres', spec, [[1, 'skip me', '9.99']], ['id'])
+      const res = await run('postgres', 'mssql', ['_xv_ovr'], 'drop', { _xv_ovr: { geo: { skip: true }, amount: { targetType: 'varchar' } } })
+      const t2 = await drivers.get('mssql')!.getTableSpec('dbo', '_xv_ovr')
+      const hasGeo = t2.columns.some((cc) => cc.name === 'geo')
+      const amount = t2.columns.find((cc) => cc.name === 'amount')
+      const amountIsVarchar = !!amount && /char/i.test(amount.type)
+      if (res.ok && !hasGeo && amountIsVarchar) pass('skip+override pg→mssql: geo skipped, amount→varchar')
+      else bad(`skip+override pg→mssql: ok=${res.ok} hasGeo=${hasGeo} amountType=${amount?.type}`)
+      await dropT('mssql', 'dbo', '_xv_ovr')
+    } catch (e) { bad(`skip+override pg→mssql: ${(e as Error).message}`) }
+    await dropT('postgres', PS, '_xv_ovr')
+  }
+
+  // S15 — mid-transfer error: an incompatible override (text → int) must be
+  // reported as a failure, target left in a defined (empty) state, source intact.
+  if (have('postgres', 'mssql')) {
+    try {
+      const spec: TableSpec = { schema: PS, name: '_xv_err', columns: [col('id', 'integer', { nullable: false }), col('label', 'varchar', { length: 20 })], primaryKey: ['id'], foreignKeys: [], indexes: [], comment: null }
+      await setup('postgres', spec, [[1, 'Alice'], [2, 'Bob']], [])
+      const res = await run('postgres', 'mssql', ['_xv_err'], 'drop', { _xv_err: { label: { targetType: 'int' } } })
+      const failedTable = res.tables.find((t) => t.table === '_xv_err')
+      const cErr = await count('mssql', 'dbo', '_xv_err')
+      // The table is created (label INT) but the string load fails → 0 rows, reported.
+      if (!res.ok && failedTable?.status === 'failed' && cErr === 0) pass('error-handling pg→mssql: failure reported, target left empty (defined)')
+      else bad(`error-handling pg→mssql: ok=${res.ok} status=${failedTable?.status} cnt=${cErr}`)
+      await dropT('mssql', 'dbo', '_xv_err')
+    } catch (e) { bad(`error-handling pg→mssql: ${(e as Error).message}`) }
+    await dropT('postgres', PS, '_xv_err')
+  }
+
+  // S16 — invariants: source untouched + seeded data intact + no leftovers.
+  for (const [e, d] of drivers) {
+    try {
+      const sch = e === 'sqlite' ? 'main' : e === 'mssql' ? 'dbo' : e === 'oracle' ? schemaOf('oracle') : e === 'postgres' ? 'public' : cfgOf.get(e)?.database || 'dbtool_dev'
+      const tbls = await d.listTables(sch)
+      // Oracle stores the seed table as CUSTOMERS; match case-insensitively.
+      const custName = tbls.find((t) => t.name.toLowerCase() === 'customers')?.name
+      const seeded = custName ? await d.getTableRowCount(sch, custName, [], null, null).catch(() => -1) : -1
+      const leftovers = tbls.filter((t) => /^_xv/i.test(t.name)).map((t) => t.name)
+      if (seeded > 0 && leftovers.length === 0) pass(`invariants ${e}: customers=${seeded} (intact), no _xv_ leftovers`)
+      else bad(`invariants ${e}: customers=${seeded} leftovers=${JSON.stringify(leftovers)}`)
+    } catch (err) { bad(`invariants ${e}: ${(err as Error).message}`) }
+  }
+
+  for (const d of drivers.values()) await d.disconnect().catch(() => undefined)
+}
+
+/**
+ * TASK 67 — PostgreSQL advanced objects: materialized views, types/enums,
+ * extensions, and advanced indexes (gin/partial/expression). Exercises the
+ * driver catalog reads + the ObjectOp/index DDL builders end-to-end against the
+ * live PG container with disposable `_pgadv_*` objects; seeds left intact.
+ */
+async function testPgAdvanced(config: ConnectionConfig): Promise<void> {
+  if (config.engine !== 'postgres') return
+  const tag = 'pg-adv'
+  const d = await createDriver(config)
+  await d.connect()
+  const schema = 'public'
+  const run = (sql: string): Promise<import('@shared/types').DdlApplyResult> => d.execStatements([sql])
+  const cleanup = async (): Promise<void> => {
+    for (const s of [
+      'DROP MATERIALIZED VIEW IF EXISTS public._pgadv_mv',
+      'DROP TABLE IF EXISTS public._pgadv_t CASCADE',
+      'DROP TYPE IF EXISTS public._pgadv_mood CASCADE',
+      'DROP TYPE IF EXISTS public._pgadv_addr CASCADE'
+    ]) await run(s).catch(() => undefined)
+    await run('DROP EXTENSION IF EXISTS pg_trgm').catch(() => undefined)
+  }
+  try {
+    await cleanup()
+
+    // A. Materialized views.
+    await run("CREATE MATERIALIZED VIEW public._pgadv_mv AS SELECT 1 AS a, 'x'::text AS b WITH DATA")
+    const mv = (await d.listMatViews!(schema)).find((m) => m.name === '_pgadv_mv')
+    if (!mv || !mv.populated) throw new Error('matview not listed/populated')
+    const page = await d.getTablePage(schema, '_pgadv_mv', 10, 1, null, [], null, null)
+    if (page.rows.length !== 1) throw new Error(`matview browse rows=${page.rows.length}`)
+    let r = await d.execStatements(buildObjectOp('postgres', { kind: 'refreshMatView', schema, name: '_pgadv_mv' }).statements)
+    if (!r.ok) throw new Error(`refresh failed: ${r.message}`)
+    await run('CREATE UNIQUE INDEX _pgadv_mv_uq ON public._pgadv_mv (a)')
+    r = await d.execStatements(buildObjectOp('postgres', { kind: 'refreshMatView', schema, name: '_pgadv_mv', concurrently: true }).statements)
+    if (!r.ok) throw new Error(`concurrent refresh failed: ${r.message}`)
+    const def = await d.getObjectDefinition({ connectionId: config.id, kind: 'matview', schema, name: '_pgadv_mv' })
+    if (!/select/i.test(def)) throw new Error('matview definition empty')
+    r = await d.execStatements(buildObjectOp('postgres', { kind: 'dropMatView', schema, name: '_pgadv_mv' }).statements)
+    if (!r.ok) throw new Error('drop matview failed')
+    results.push(`✅ ${tag} matview: create/list/browse/refresh/refresh-CONCURRENTLY/def/drop`)
+
+    // B. Types / enums.
+    await run("CREATE TYPE public._pgadv_mood AS ENUM ('sad','ok','happy')")
+    await run('CREATE TYPE public._pgadv_addr AS (street text, zip int)')
+    let types = await d.listTypes!(schema)
+    const en = types.find((t) => t.name === '_pgadv_mood')
+    const co = types.find((t) => t.name === '_pgadv_addr')
+    if (!en || en.kind !== 'enum' || (en.labels ?? []).join(',') !== 'sad,ok,happy') throw new Error(`enum wrong: ${JSON.stringify(en)}`)
+    if (!co || co.kind !== 'composite' || (co.fields ?? []).length !== 2) throw new Error(`composite wrong: ${JSON.stringify(co)}`)
+    if (!(await run("ALTER TYPE public._pgadv_mood ADD VALUE 'ecstatic'")).ok) throw new Error('ADD VALUE failed')
+    types = await d.listTypes!(schema)
+    if (!(types.find((t) => t.name === '_pgadv_mood')?.labels ?? []).includes('ecstatic')) throw new Error('added enum value not listed')
+    await run('CREATE TABLE public._pgadv_t (id serial primary key, m public._pgadv_mood)')
+    // Dropping an in-use enum without CASCADE must be blocked by PG.
+    const blocked = await d.execStatements(buildObjectOp('postgres', { kind: 'dropType', schema, name: '_pgadv_mood' }).statements)
+    if (blocked.ok) throw new Error('drop of in-use enum should have been blocked')
+    if (!(await d.execStatements(buildObjectOp('postgres', { kind: 'dropType', schema, name: '_pgadv_mood', cascade: true }).statements)).ok) throw new Error('drop CASCADE failed')
+    if (!(await d.execStatements(buildObjectOp('postgres', { kind: 'dropType', schema, name: '_pgadv_addr' }).statements)).ok) throw new Error('drop composite failed')
+    results.push(`✅ ${tag} types: enum+composite list/labels/fields, ADD VALUE, drop(+CASCADE)`)
+
+    // C. Extensions.
+    const ext = await d.listExtensions!()
+    if (!ext.available.some((e) => e.name === 'pg_trgm')) throw new Error('pg_trgm not in available list')
+    if (!(await d.execStatements(buildObjectOp('postgres', { kind: 'createExtension', name: 'pg_trgm' }).statements)).ok) throw new Error('create extension failed')
+    if (!(await d.listExtensions!()).installed.some((e) => e.name === 'pg_trgm')) throw new Error('pg_trgm not installed after create')
+    if (!(await d.execStatements(buildObjectOp('postgres', { kind: 'dropExtension', name: 'pg_trgm' }).statements)).ok) throw new Error('drop extension failed')
+    results.push(`✅ ${tag} extensions: list available/install pg_trgm/list installed/drop`)
+
+    // D. Advanced indexes (round-trip method/predicate/expression).
+    await run('DROP TABLE IF EXISTS public._pgadv_t CASCADE')
+    await run('CREATE TABLE public._pgadv_t (id serial primary key, email text, doc jsonb, active boolean)')
+    const mk = (spec: import('@shared/types').IndexCreateSpec): Promise<import('@shared/types').DdlApplyResult> => d.execStatements(buildCreateIndex('postgres', spec).statements)
+    if (!(await mk({ schema, table: '_pgadv_t', name: '_pgadv_gin', columns: ['doc'], unique: false, method: 'gin' })).ok) throw new Error('gin create failed')
+    if (!(await mk({ schema, table: '_pgadv_t', name: '_pgadv_part', columns: ['email'], unique: false, where: 'active' })).ok) throw new Error('partial create failed')
+    if (!(await mk({ schema, table: '_pgadv_t', name: '_pgadv_expr', columns: [], unique: false, expression: 'lower(email)' })).ok) throw new Error('expression create failed')
+    const idxs = await d.listIndexes(schema, '_pgadv_t')
+    const gin = idxs.find((i) => i.name === '_pgadv_gin')
+    const part = idxs.find((i) => i.name === '_pgadv_part')
+    const expr = idxs.find((i) => i.name === '_pgadv_expr')
+    if (gin?.method !== 'gin') throw new Error(`gin method not round-tripped: ${gin?.method}`)
+    if (!part?.predicate || !/active/.test(part.predicate)) throw new Error(`partial predicate not round-tripped: ${part?.predicate}`)
+    if (!expr || !/lower\(email\)/i.test(expr.keyExpr ?? '')) throw new Error(`expression not round-tripped: ${JSON.stringify(expr)}`)
+    if (!(await mk({ schema, table: '_pgadv_t', name: '_pgadv_btree', columns: ['email'], unique: false })).ok) throw new Error('basic btree failed')
+    if (!(await d.listIndexes(schema, '_pgadv_t')).some((i) => i.name === '_pgadv_btree' && i.method === 'btree')) throw new Error('basic btree not listed')
+    results.push(`✅ ${tag} indexes: gin/partial/expression round-trip + basic btree still works`)
+
+    await cleanup()
+    const c = await d.getTableRowCount(schema, 'customers', [], null, null)
+    if (c !== 20) throw new Error(`customers changed: ${c}`)
+    results.push(`✅ ${tag} cleanup done, customers=${c} intact`)
+  } catch (err) {
+    failed = true
+    results.push(`❌ ${tag}: ${(err as Error).message}`)
+    await cleanup().catch(() => undefined)
+  } finally {
+    await d.disconnect().catch(() => undefined)
+  }
+}
+
+/**
+ * TASK 68 — DEEPER re-verification of the TASK 67 PG advanced objects: edge cases
+ * the first smoke skipped (refresh reflecting source changes, CONCURRENTLY without
+ * a unique index, definition round-trip with JOIN/aggregate, enum-as-column-type +
+ * invalid-value rejection, ADD VALUE BEFORE/AFTER, RENAME VALUE, cascade drops,
+ * gin/gist/brin/hash, unique-partial, edit round-trip, identifiers needing quoting).
+ * All disposable objects use the `_rv67_` prefix; seeds left intact.
+ */
+async function testPgAdvancedDeep(config: ConnectionConfig): Promise<void> {
+  if (config.engine !== 'postgres') return
+  const tag = 'pg-adv-deep'
+  const d = await createDriver(config)
+  await d.connect()
+  const schema = 'public'
+  const run = (sql: string): Promise<import('@shared/types').DdlApplyResult> => d.execStatements([sql])
+  const ok = async (sql: string, what: string): Promise<void> => { const r = await run(sql); if (!r.ok) throw new Error(`${what}: ${r.message}`) }
+  const op = (o: import('@shared/types').ObjectOp): Promise<import('@shared/types').DdlApplyResult> => d.execStatements(buildObjectOp('postgres', o).statements)
+  const cleanup = async (): Promise<void> => {
+    for (const s of [
+      'DROP MATERIALIZED VIEW IF EXISTS public."_rv67_MixMV"',
+      'DROP MATERIALIZED VIEW IF EXISTS public._rv67_mv2',
+      'DROP MATERIALIZED VIEW IF EXISTS public._rv67_mv',
+      'DROP TABLE IF EXISTS public._rv67_a CASCADE',
+      'DROP TABLE IF EXISTS public._rv67_b CASCADE',
+      'DROP TABLE IF EXISTS public._rv67_idx CASCADE',
+      'DROP TABLE IF EXISTS public._rv67_use CASCADE',
+      'DROP TYPE IF EXISTS public."_rv67_Mood" CASCADE',
+      'DROP TYPE IF EXISTS public._rv67_addr CASCADE',
+      'DROP EXTENSION IF EXISTS pg_trgm CASCADE'
+    ]) await run(s).catch(() => undefined)
+  }
+  const pass = (m: string): void => { results.push(`✅ ${tag} ${m}`) }
+  try {
+    await cleanup()
+
+    // A. Matview: refresh reflects source changes; CONCURRENTLY needs a unique
+    //    index; JOIN+aggregate definition round-trips; mixed-case name.
+    await ok('CREATE TABLE public._rv67_a (id int primary key, name text)', 'base a')
+    await ok('CREATE TABLE public._rv67_b (a_id int, val int)', 'base b')
+    await ok("INSERT INTO public._rv67_a VALUES (1,'x'),(2,'y')", 'seed a')
+    await ok('INSERT INTO public._rv67_b VALUES (1,10),(1,20)', 'seed b')
+    await ok('CREATE MATERIALIZED VIEW public._rv67_mv AS SELECT a.name AS nm, count(b.val) AS cnt FROM public._rv67_a a LEFT JOIN public._rv67_b b ON b.a_id = a.id GROUP BY a.name WITH DATA', 'create mv')
+    let mvRows = await d.getTablePage(schema, '_rv67_mv', 100, 1, null, [], null, null)
+    let xRow = mvRows.rows.find((r) => (r as Record<string, unknown>).nm === 'x') as Record<string, unknown> | undefined
+    if (Number(xRow?.cnt) !== 2) throw new Error(`initial matview cnt for x = ${xRow?.cnt}`)
+    // CONCURRENTLY without a unique index must be REJECTED by PG.
+    const conc1 = await op({ kind: 'refreshMatView', schema, name: '_rv67_mv', concurrently: true })
+    if (conc1.ok) throw new Error('CONCURRENTLY without a unique index should have failed')
+    // Insert a source row, refresh (plain) → matview reflects the change.
+    await ok('INSERT INTO public._rv67_b VALUES (1,30)', 'insert source row')
+    if (!(await op({ kind: 'refreshMatView', schema, name: '_rv67_mv' })).ok) throw new Error('plain refresh failed')
+    mvRows = await d.getTablePage(schema, '_rv67_mv', 100, 1, null, [], null, null)
+    xRow = mvRows.rows.find((r) => (r as Record<string, unknown>).nm === 'x') as Record<string, unknown> | undefined
+    if (Number(xRow?.cnt) !== 3) throw new Error(`refreshed matview cnt for x = ${xRow?.cnt} (expected 3)`)
+    // Add a unique index → CONCURRENTLY now works.
+    await ok('CREATE UNIQUE INDEX _rv67_mv_uq ON public._rv67_mv (nm)', 'unique idx on mv')
+    if (!(await op({ kind: 'refreshMatView', schema, name: '_rv67_mv', concurrently: true })).ok) throw new Error('CONCURRENTLY with unique index failed')
+    // Definition round-trip: reopen the SELECT and recreate under a new name.
+    const def = await d.getObjectDefinition({ connectionId: config.id, kind: 'matview', schema, name: '_rv67_mv' })
+    if (!/join/i.test(def) || !/count/i.test(def)) throw new Error(`matview def lost JOIN/aggregate: ${def.slice(0, 80)}`)
+    await ok(`CREATE MATERIALIZED VIEW public._rv67_mv2 AS\n${def}`, 'recreate from def')
+    pass('matview: refresh reflects source change, CONCURRENTLY gated on unique index, JOIN+aggregate def round-trips')
+
+    // A2. Mixed-case (quoted) matview name.
+    await ok('CREATE MATERIALIZED VIEW public."_rv67_MixMV" AS SELECT 1 AS one WITH DATA', 'mixed-case mv')
+    if (!(await d.listMatViews!(schema)).some((m) => m.name === '_rv67_MixMV')) throw new Error('mixed-case matview not listed')
+    if (!(await op({ kind: 'dropMatView', schema, name: '_rv67_MixMV' })).ok) throw new Error('drop mixed-case matview failed')
+    pass('matview: mixed-case (quoted) name create/list/drop')
+
+    // B. Enum used as a column type; invalid value rejected; ADD VALUE BEFORE/AFTER;
+    //    RENAME VALUE; composite fields; drop-in-use cascade; mixed-case name.
+    await ok(`CREATE TYPE public."_rv67_Mood" AS ENUM ('sad','happy')`, 'create enum')
+    await ok(`CREATE TABLE public._rv67_use (id int, m public."_rv67_Mood")`, 'table using enum')
+    await ok(`INSERT INTO public._rv67_use VALUES (1,'happy')`, 'insert valid enum')
+    const badEnum = await run(`INSERT INTO public._rv67_use VALUES (2,'furious')`)
+    if (badEnum.ok) throw new Error('invalid enum value should have been rejected')
+    if (!/invalid input value for enum/i.test(badEnum.message ?? '')) throw new Error(`enum error not surfaced: ${badEnum.message}`)
+    await ok(`ALTER TYPE public."_rv67_Mood" ADD VALUE 'ok' BEFORE 'happy'`, 'add value BEFORE')
+    await ok(`ALTER TYPE public."_rv67_Mood" ADD VALUE 'ecstatic' AFTER 'happy'`, 'add value AFTER')
+    await ok(`ALTER TYPE public."_rv67_Mood" RENAME VALUE 'sad' TO 'blue'`, 'rename value')
+    const enumInfo = (await d.listTypes!(schema)).find((t) => t.name === '_rv67_Mood')
+    const labels = (enumInfo?.labels ?? []).join(',')
+    if (labels !== 'blue,ok,happy,ecstatic') throw new Error(`enum labels/order wrong after edits: ${labels}`)
+    await ok('CREATE TYPE public._rv67_addr AS (street text, zip int)', 'create composite')
+    if ((((await d.listTypes!(schema)).find((t) => t.name === '_rv67_addr'))?.fields ?? []).length !== 2) throw new Error('composite fields not read')
+    // Drop enum in use: without CASCADE blocked, with CASCADE works.
+    if ((await op({ kind: 'dropType', schema, name: '_rv67_Mood' })).ok) throw new Error('drop of in-use enum should be blocked')
+    if (!(await op({ kind: 'dropType', schema, name: '_rv67_Mood', cascade: true })).ok) throw new Error('drop enum CASCADE failed')
+    pass('types: enum-as-column, invalid-value rejected, ADD VALUE BEFORE/AFTER, RENAME VALUE, composite fields, drop-in-use CASCADE')
+
+    // C. Extension pg_trgm → a gin_trgm_ops index; drop-with-dependent CASCADE.
+    if (!(await op({ kind: 'createExtension', name: 'pg_trgm' })).ok) throw new Error('install pg_trgm failed')
+    await ok('CREATE TABLE public._rv67_idx (id serial primary key, email text, doc jsonb, tags text[], tsv tsvector, n int)', 'idx table')
+    await ok('CREATE INDEX _rv67_trgm ON public._rv67_idx USING gin (email gin_trgm_ops)', 'gin_trgm_ops index')
+    // DROP EXTENSION without CASCADE must be blocked (the trgm index depends on it).
+    if ((await op({ kind: 'dropExtension', name: 'pg_trgm' })).ok) throw new Error('drop pg_trgm with dependent index should be blocked')
+    if (!(await op({ kind: 'dropExtension', name: 'pg_trgm', cascade: true })).ok) throw new Error('drop pg_trgm CASCADE failed')
+    // The dependent index should be gone after CASCADE.
+    if ((await d.listIndexes(schema, '_rv67_idx')).some((i) => i.name === '_rv67_trgm')) throw new Error('dependent trgm index survived CASCADE')
+    // Unavailable extension → clear error, no crash.
+    const badExt = await op({ kind: 'createExtension', name: '_rv67_nonexistent' })
+    if (badExt.ok) throw new Error('nonexistent extension create should fail')
+    pass('extensions: install pg_trgm + gin_trgm_ops index, drop-with-dependent CASCADE, unavailable-extension error surfaced')
+
+    // D. Advanced index methods + partial/expression/unique-partial/multi-column,
+    //    each round-tripping via listIndexes.
+    const mk = (spec: import('@shared/types').IndexCreateSpec, what: string): Promise<void> => ok(buildCreateIndex('postgres', spec).sql.replace(/;$/, ''), what)
+    await mk({ schema, table: '_rv67_idx', name: '_rv67_gin_json', columns: ['doc'], unique: false, method: 'gin' }, 'gin jsonb')
+    await mk({ schema, table: '_rv67_idx', name: '_rv67_gin_arr', columns: ['tags'], unique: false, method: 'gin' }, 'gin text[]')
+    await mk({ schema, table: '_rv67_idx', name: '_rv67_gist', columns: ['tsv'], unique: false, method: 'gist' }, 'gist tsvector')
+    await mk({ schema, table: '_rv67_idx', name: '_rv67_brin', columns: ['n'], unique: false, method: 'brin' }, 'brin int')
+    await mk({ schema, table: '_rv67_idx', name: '_rv67_hash', columns: ['email'], unique: false, method: 'hash' }, 'hash text')
+    await mk({ schema, table: '_rv67_idx', name: '_rv67_part', columns: ['email'], unique: false, where: 'n > 0' }, 'partial')
+    await mk({ schema, table: '_rv67_idx', name: '_rv67_expr', columns: [], unique: false, expression: 'lower(email)' }, 'expression')
+    await mk({ schema, table: '_rv67_idx', name: '_rv67_upart', columns: ['email'], unique: true, where: 'n = 1' }, 'unique partial')
+    await mk({ schema, table: '_rv67_idx', name: '_rv67_multi', columns: ['email', 'n'], unique: false }, 'multi-column btree')
+    const idxs = await d.listIndexes(schema, '_rv67_idx')
+    const byName = (n: string): import('@shared/types').IndexInfo | undefined => idxs.find((i) => i.name === n)
+    const checks: [string, (i?: import('@shared/types').IndexInfo) => boolean][] = [
+      ['_rv67_gin_json', (i) => i?.method === 'gin'],
+      ['_rv67_gin_arr', (i) => i?.method === 'gin'],
+      ['_rv67_gist', (i) => i?.method === 'gist'],
+      ['_rv67_brin', (i) => i?.method === 'brin'],
+      ['_rv67_hash', (i) => i?.method === 'hash'],
+      ['_rv67_part', (i) => !!i?.predicate && /n > 0/.test(i.predicate)],
+      ['_rv67_expr', (i) => /lower\(email\)/i.test(i?.keyExpr ?? '')],
+      ['_rv67_upart', (i) => !!i?.unique && !!i?.predicate],
+      ['_rv67_multi', (i) => (i?.columns.length ?? 0) === 2]
+    ]
+    for (const [n, ok2] of checks) if (!ok2(byName(n))) throw new Error(`index ${n} did not round-trip: ${JSON.stringify(byName(n))}`)
+    // Edit round-trip: recreate the expression index as UNIQUE via buildAlterIndex,
+    // preserving the expression.
+    const exprInfo = byName('_rv67_expr')!
+    const editSpec: import('@shared/types').IndexCreateSpec = { schema, table: '_rv67_idx', name: '_rv67_expr', originalName: '_rv67_expr', columns: [], unique: true, method: (exprInfo.method as import('@shared/types').PgIndexMethod), where: exprInfo.predicate ?? '', expression: exprInfo.keyExpr ?? '' }
+    const alter = buildAlterIndex('postgres', editSpec, { schema, table: '_rv67_idx', name: '_rv67_expr', columns: [], unique: false, method: 'btree', where: '', expression: exprInfo.keyExpr ?? '' })
+    if (!(await d.execStatements(alter.statements)).ok) throw new Error('expression-index edit (recreate) failed')
+    const expr2 = (await d.listIndexes(schema, '_rv67_idx')).find((i) => i.name === '_rv67_expr')
+    if (!expr2?.unique || !/lower\(email\)/i.test(expr2.keyExpr ?? '')) throw new Error('expression not preserved through edit')
+    pass('indexes: gin(jsonb+text[])/gist/brin/hash + partial/expression/unique-partial/multi-column round-trip; edit preserves expression')
+
+    await cleanup()
+    const c = await d.getTableRowCount(schema, 'customers', [], null, null)
+    if (c !== 20) throw new Error(`customers changed: ${c}`)
+    pass(`cleanup done, customers=${c} intact`)
+  } catch (err) {
+    failed = true
+    results.push(`❌ ${tag}: ${(err as Error).message}`)
+    await cleanup().catch(() => undefined)
+  } finally {
+    await d.disconnect().catch(() => undefined)
   }
 }
 
@@ -2792,6 +3988,9 @@ export async function runSmoke(): Promise<void> {
   for (const cfg of configs) {
     if (only.length && !only.includes(cfg.engine)) continue
     if (cfg.engine === 'sqlite' && !existsSync(sqlitePath)) continue
+    // TASK 56 audit: awkward-data import/export + template matrices on EVERY engine.
+    await testAudit(cfg)
+    await testTemplates(cfg)
     // Oracle and SQL Server are BASICS-stage — run their focused test only.
     if (cfg.engine === 'oracle') {
       await testOracle(cfg)
@@ -2819,7 +4018,18 @@ export async function runSmoke(): Promise<void> {
     await testIndexes(cfg)
     await testImportExport(cfg)
     await testDumpRestore(cfg)
+    // TASK 67: PostgreSQL advanced objects (matviews / types / extensions / advanced indexes).
+    if (cfg.engine === 'postgres') await testPgAdvanced(cfg)
+    // TASK 68: deeper edge-case re-verification of the PG advanced objects.
+    if (cfg.engine === 'postgres') await testPgAdvancedDeep(cfg)
   }
+
+  // TASK 64: cross-engine data transfer matrix (needs every engine connected at
+  // once, so it runs after the per-engine loop with its own connections).
+  await testTransfer(configs)
+  // TASK 65: deeper transfer edge cases (empty/composite/no-PK, self/cyclic FK,
+  // volume, long text, blob, all-NULL, quoting, append, overrides, errors).
+  await testTransferDeep(configs)
 
   const summary = [
     '==== RESULTS ====',

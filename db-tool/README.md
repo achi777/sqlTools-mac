@@ -23,9 +23,16 @@ offers a **SQL / Windows Authentication** selector (Windows Auth is detected and
 never auto-installed — SQL Auth is the portable path) plus
 `encrypt`/`trustServerCertificate` toggles, and uses `[bracket]` quoting with
 `@p` parameters. **Oracle** (via **node-oracledb**, Thin/Thick with Instant-
-Client detection) is supported at the basics-plus level (sequences, triggers,
-indexes, routines, SQL export). MariaDB reuses the MySQL driver and
-adds standalone **sequences** (shown in the tree like PostgreSQL). See
+Client detection) is a full engine — sequences, triggers, indexes, routines,
+views, SQL export, and an ER diagram (FK render + FK/table edit; no `ON UPDATE`
+per Oracle). MariaDB reuses the MySQL driver and
+adds standalone **sequences** (shown in the tree like PostgreSQL). **PostgreSQL**
+additionally manages **materialized views** (create / refresh incl.
+`CONCURRENTLY` / browse / drop), **user-defined types & enums** (create enum +
+composite, add / rename enum value with the drop-value limitation surfaced,
+drop), **extensions** (list installed + available, create / update / drop), and
+**advanced indexes** (`btree`/`hash`/`gin`/`gist`/`brin`, partial `WHERE`,
+expression) — all PostgreSQL-only. See
 [`COMPATIBILITY.md`](./COMPATIBILITY.md) for the full feature × version matrix,
 the Oracle Thin/Thick and SQL Server auth notes, per-engine caveats (e.g.
 MySQL/MariaDB have no `FULL OUTER JOIN`; sequences are PostgreSQL + MariaDB only),
@@ -76,6 +83,21 @@ click **Connect** on "Local Postgres", "Local MySQL", or "Local SQLite" and go.
    edit it, press Enter → a parameterized `UPDATE … WHERE id = ?` runs; re-run
    the query to see the change persist.
 5. Repeat for **MySQL** and **SQLite** — same UI, different engine.
+6. Click the **sun/moon** icon in the bottom-right status bar to switch between
+   the **dark** (default) and **light** themes — the choice persists across
+   restarts and applies everywhere (tree, grid, editor, ER diagram, dialogs).
+7. Build a filter, then click the **Saved filters** (💾) button in the grid
+   toolbar to **name and save** it; the same table's saved filters are listed
+   there to **apply / rename / delete**. Saved filters are keyed by
+   `engine::schema::table` and persisted in userData, so they survive restarts
+   and are only offered on the table they were built for.
+8. Press **F1** (or the ⌨ status-bar button) for the **keyboard-shortcuts**
+   reference. Common actions have cross-platform (Ctrl on Windows/Linux, ⌘ on
+   macOS) shortcuts — run query (`Ctrl+Enter`/`F5`), refresh (`Ctrl+R`/`F5`),
+   new/close tab (`Ctrl+T`/`Ctrl+W`), apply row edits (`Ctrl+S`), delete a
+   selected row (`Delete`, staged then applied), toggle the sidebar (`Ctrl+B`),
+   and `Esc` to close dialogs — none of which trigger a browser-style
+   window reload/close.
 
 > The SQLite default points at a file in Electron's `userData` dir. To seed it
 > with the sample schema+data, either point the connection at a pre-seeded file
@@ -273,9 +295,23 @@ config is present today, and none is required to build or run the app.
 to this shape (via IPC) and does not care which engine is underneath.
 
 **Where things are stored.** Saved connections persist as JSON in Electron's
-`userData` dir — **never in the repo**. For this slice, passwords are stored in
-that file in plaintext with a `TODO(security)` to move them to the OS keychain.
-Passwords are never logged.
+`userData` dir — **never in the repo**. Non-secret fields (host, port, user,
+database, options) are plaintext; **connection passwords are encrypted at rest
+with Electron `safeStorage`** — OS-keychain-backed (DPAPI on Windows, Keychain on
+macOS, libsecret/kwallet on Linux), **no native module** — and stored as base64
+under `passwordEnc`. The plaintext password is decrypted **only in the main
+process** at connect time, is **never written to disk**, and is **never sent to
+the renderer** (the edit form shows a masked `••••••• (unchanged)` placeholder and
+a "Clear stored password" option). Passwords are never logged.
+
+- **Migration:** on first launch after the upgrade, any legacy plaintext
+  passwords are encrypted in place. The connections file is **backed up first**
+  (`connections.json.bak-<timestamp>`), and the migration is **idempotent** (a
+  no-op once nothing plaintext remains, no duplicates).
+- **Fallback:** if `safeStorage.isEncryptionAvailable()` is false, the app does
+  **not** silently store plaintext — it warns in the connection form and does not
+  persist the password (you enter it per session); any existing plaintext file is
+  left untouched rather than destroyed. This works on Windows and macOS.
 
 ---
 

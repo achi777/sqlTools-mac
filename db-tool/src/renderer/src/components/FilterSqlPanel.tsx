@@ -19,6 +19,7 @@ export function FilterSqlPanel(): JSX.Element | null {
   const collapsed = useStore((s) => s.filterSqlCollapsed)
   const toggle = useStore((s) => s.toggleFilterSql)
   const openSqlInNewTab = useStore((s) => s.openSqlInNewTab)
+  const theme = useStore((s) => s.theme)
 
   const [copied, setCopied] = useState(false)
 
@@ -103,7 +104,7 @@ export function FilterSqlPanel(): JSX.Element | null {
       </div>
       {!collapsed && (
         <div className="fsql-body">
-          <CodeMirror value={sqlText} theme="dark" editable={false} extensions={extensions} basicSetup={{ lineNumbers: false, foldGutter: false, highlightActiveLine: false }} />
+          <CodeMirror value={sqlText} theme={theme} editable={false} extensions={extensions} basicSetup={{ lineNumbers: false, foldGutter: false, highlightActiveLine: false }} />
         </div>
       )}
     </div>

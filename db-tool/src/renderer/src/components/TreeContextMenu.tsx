@@ -22,6 +22,7 @@ export function TreeContextMenu(): JSX.Element | null {
   const openImport = useStore((s) => s.openImport)
   const openDbDump = useStore((s) => s.openDbDump)
   const openRestore = useStore((s) => s.openRestore)
+  const openTransfer = useStore((s) => s.openTransfer)
   const openViewInBuilder = useStore((s) => s.openViewInBuilder)
   const openEditView = useStore((s) => s.openEditView)
   const openNewRoutine = useStore((s) => s.openNewRoutine)
@@ -29,6 +30,11 @@ export function TreeContextMenu(): JSX.Element | null {
   const openNewPackage = useStore((s) => s.openNewPackage)
   const openEditPackagePart = useStore((s) => s.openEditPackagePart)
   const openViewData = useStore((s) => s.openViewData)
+  const openNewMatView = useStore((s) => s.openNewMatView)
+  const openEditMatView = useStore((s) => s.openEditMatView)
+  const openNewType = useStore((s) => s.openNewType)
+  const openTypeAlter = useStore((s) => s.openTypeAlter)
+  const openExtensions = useStore((s) => s.openExtensions)
   const engineOf = useStore((s) => s.engineOf)
 
   useEffect(() => {
@@ -57,8 +63,12 @@ export function TreeContextMenu(): JSX.Element | null {
     }
     if (engineOf(target.connectionId) === 'postgres') {
       items.push({ label: 'New sequence…', run: () => openNewSequence(target.connectionId, target.schema) })
+      items.push({ label: 'New materialized view…', run: () => openNewMatView(target.connectionId, target.schema) })
+      items.push({ label: 'New type / enum…', run: () => openNewType(target.connectionId, target.schema) })
+      items.push({ label: 'Extensions…', run: () => openExtensions(target.connectionId) })
     }
     items.push({ label: 'Import / Export', divider: true, run: () => {} })
+    items.push({ label: 'Data Transfer… (copy tables to another connection)', run: () => openTransfer(target.connectionId, target.schema) })
     items.push({ label: 'Dump database to SQL file…', run: () => openDbDump(target.connectionId, target.schema) })
     items.push({ label: 'Execute SQL file… (restore)', run: () => openRestore(target.connectionId, target.schema) })
   }
@@ -158,11 +168,36 @@ export function TreeContextMenu(): JSX.Element | null {
       })
     }
   }
+  // --- PostgreSQL advanced objects (TASK 67) ---
+  if (target.kind === 'matview') {
+    items.push({ label: 'Open data', run: () => void openViewData(target.connectionId, target.schema, target.name) })
+    items.push({ label: 'Edit (drop + recreate)…', run: () => void openEditMatView(target.connectionId, target.schema, target.name) })
+    items.push({ label: 'Refresh data', run: () => void openObjectOp(target.connectionId, { kind: 'refreshMatView', schema: target.schema, name: target.name }) })
+    items.push({ label: 'Refresh CONCURRENTLY (needs a UNIQUE index)', run: () => void openObjectOp(target.connectionId, { kind: 'refreshMatView', schema: target.schema, name: target.name, concurrently: true }) })
+    items.push({ label: 'Drop materialized view…', danger: true, run: () => void openObjectOp(target.connectionId, { kind: 'dropMatView', schema: target.schema, name: target.name }) })
+  }
+  if (target.kind === 'type') {
+    if (target.typeKind === 'enum') {
+      items.push({ label: 'Add enum value…', run: () => openTypeAlter(target.connectionId, target.schema, target.name, 'addValue') })
+    }
+    items.push({ label: 'Rename type / value…', run: () => openTypeAlter(target.connectionId, target.schema, target.name, 'rename') })
+    items.push({ label: 'Drop type…', danger: true, run: () => void openObjectOp(target.connectionId, { kind: 'dropType', schema: target.schema, name: target.name }) })
+    items.push({ label: 'Drop type (CASCADE)…', danger: true, run: () => void openObjectOp(target.connectionId, { kind: 'dropType', schema: target.schema, name: target.name, cascade: true }) })
+  }
+  if (target.kind === 'extensionsCat') {
+    items.push({ label: 'Install / manage extensions…', run: () => openExtensions(target.connectionId) })
+  }
+  if (target.kind === 'extension') {
+    items.push({ label: 'Update to latest version', run: () => void openObjectOp(target.connectionId, { kind: 'updateExtension', name: target.name }) })
+    items.push({ label: 'Drop extension…', danger: true, run: () => void openObjectOp(target.connectionId, { kind: 'dropExtension', name: target.name }) })
+    items.push({ label: 'Drop extension (CASCADE)…', danger: true, run: () => void openObjectOp(target.connectionId, { kind: 'dropExtension', name: target.name, cascade: true }) })
+  }
   if (target.kind === 'table') {
     items.push({ label: 'Design table…', run: () => void openEditTable(target.connectionId, target.schema, target.table) })
     items.push({ label: 'Export…', run: () => openExport(target.connectionId, target.schema, target.table, false) })
     items.push({ label: 'Dump table to SQL…', run: () => openExport(target.connectionId, target.schema, target.table, false, 'sql') })
     items.push({ label: 'Import…', run: () => openImport(target.connectionId, target.schema, target.table) })
+    items.push({ label: 'Data Transfer… (copy to another connection)', run: () => openTransfer(target.connectionId, target.schema, target.table) })
     items.push({ label: 'New index…', run: () => openNewIndex(target.connectionId, target.schema, target.table) })
     items.push({ label: 'New trigger…', run: () => openNewTrigger(target.connectionId, target.schema, target.table) })
     items.push({

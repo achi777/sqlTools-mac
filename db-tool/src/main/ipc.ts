@@ -26,6 +26,8 @@ import {
   type QueryResult,
   type RowChangeRequest,
   type SchemaCatalog,
+  type TransferPlanRequest,
+  type TransferRequest,
   type UpdateCellRequest
 } from '@shared/types'
 import { createDriver, type DbDriver } from './driver'
@@ -33,14 +35,21 @@ import { buildObjectOp, buildTableDdl } from './ddl'
 import { runExport } from './exporter'
 import { previewImport, runImport } from './importer'
 import { dumpDatabase, executeSqlFile, previewSqlFile } from './dumper'
+import { buildTransferPlan, runTransfer } from './transfer'
 import { reverseParseView } from './viewReverse'
 import {
   deleteConnection as removeConnection,
   getConnection,
+  isSecureStorageAvailable,
+  listSavedFilters,
+  saveSavedFilter,
+  deleteSavedFilter,
   loadConnections,
   loadErLayout,
   loadTabs,
   loadUiState,
+  migratePlaintextPasswords,
+  resolvePassword,
   saveErLayout,
   saveTabs,
   saveUiState,
@@ -158,6 +167,21 @@ function defaultConnections(): ConnectionConfig[] {
 }
 
 export function registerIpc(): void {
+  // SECURITY (TASK 62): migrate any legacy plaintext passwords to encrypted
+  // (safeStorage) at rest, backing up the file first. Runs BEFORE any other
+  // write so the backup captures the pre-migration state. Idempotent.
+  try {
+    const mig = migratePlaintextPasswords()
+    if (mig.migrated > 0) {
+      // Never log secrets — only counts + the backup location.
+      console.log(`[secrets] migrated ${mig.migrated} plaintext password(s) to encrypted storage; backup: ${mig.backedUp}`)
+    } else if (!mig.secureAvailable) {
+      console.warn('[secrets] secure storage unavailable — plaintext passwords left as-is; new passwords will not be persisted')
+    }
+  } catch (err) {
+    console.error('[secrets] password migration failed (connections left intact):', (err as Error).message)
+  }
+
   // Make every pre-seeded default a real saved connection so the manager shows
   // the identical action set (connect/edit/delete) for all engines.
   seedMissingDefaults(defaultConnections())
@@ -194,15 +218,42 @@ export function registerIpc(): void {
 
   ipcMain.handle(IPC.saveConnection, (_e, config: ConnectionConfig) => {
     try {
-      // The renderer never receives passwords; on edit it sends a blank one and
-      // we keep the previously-stored secret (or the built-in default's).
-      const incoming = { ...config }
-      if (!incoming.password) {
-        const existing = getConnection(incoming.id) ?? defaultConnections().find((c) => c.id === incoming.id)
-        if (existing?.password) incoming.password = existing.password
-      }
-      const saved = upsertConnection(incoming)
-      return ok(stripSecret(saved))
+      // upsertConnection encrypts a freshly typed password, keeps the stored
+      // secret when the field is blank on edit, and clears it on request.
+      const typedPassword = typeof config.password === 'string' && config.password.length > 0
+      const saved = upsertConnection(config)
+      // If a password was provided but secure storage is unavailable, it was NOT
+      // persisted — tell the renderer so it can warn the user.
+      const warning = typedPassword && !isSecureStorageAvailable()
+        ? 'Secure storage is unavailable — the password was not saved. You will need to enter it each session.'
+        : undefined
+      return ok({ ...stripSecret(saved), warning })
+    } catch (err) {
+      return fail(err)
+    }
+  })
+
+  // Whether OS-backed secure storage is available (drives the connection-form warning).
+  ipcMain.handle(IPC.secureStorageAvailable, () => isSecureStorageAvailable())
+
+  // Saved filters (per-table, persisted in userData) — TASK 70.
+  ipcMain.handle(IPC.listSavedFilters, (_e, key: string) => {
+    try {
+      return ok(listSavedFilters(key))
+    } catch (err) {
+      return fail(err)
+    }
+  })
+  ipcMain.handle(IPC.saveSavedFilter, (_e, key: string, filter: import('@shared/types').SavedFilter) => {
+    try {
+      return ok(saveSavedFilter(key, filter))
+    } catch (err) {
+      return fail(err)
+    }
+  })
+  ipcMain.handle(IPC.deleteSavedFilter, (_e, key: string, id: string) => {
+    try {
+      return ok(deleteSavedFilter(key, id))
     } catch (err) {
       return fail(err)
     }
@@ -225,7 +276,12 @@ export function registerIpc(): void {
 
   ipcMain.handle(IPC.testConnection, async (_e, config: ConnectionConfig) => {
     try {
-      const driver = await createDriver(config)
+      // Use the freshly typed password if present, else the stored (decrypted) one.
+      const password =
+        typeof config.password === 'string' && config.password.length > 0
+          ? config.password
+          : resolvePassword(getConnection(config.id))
+      const driver = await createDriver({ ...config, password })
       return await driver.testConnection()
     } catch (err) {
       return { ok: false, message: err instanceof Error ? err.message : String(err) }
@@ -235,8 +291,10 @@ export function registerIpc(): void {
   ipcMain.handle(IPC.connect, async (_e, id: string) => {
     try {
       if (live.has(id)) return ok(null)
-      const config = getConnection(id) ?? defaultConnections().find((c) => c.id === id)
-      if (!config) throw new Error(`Unknown connection: ${id}`)
+      const stored = getConnection(id) ?? defaultConnections().find((c) => c.id === id)
+      if (!stored) throw new Error(`Unknown connection: ${id}`)
+      // Decrypt the secret in MAIN only, at connect time.
+      const config = { ...stored, password: resolvePassword(stored) }
       const driver = await createDriver(config)
       await driver.connect()
       live.set(id, driver)
@@ -575,6 +633,45 @@ export function registerIpc(): void {
     }
   })
 
+  // --- PostgreSQL advanced objects (TASK 67): matviews / types / extensions ---
+  const PG_ONLY = 'This object type is PostgreSQL-only.'
+  ipcMain.handle(IPC.listMatViews, async (_e, id: string, schema: string) => {
+    try {
+      const driver = requireDriver(id)
+      if (driver.config.engine !== 'postgres' || !driver.listMatViews) {
+        return ok({ supported: false, matviews: [], note: PG_ONLY })
+      }
+      return ok({ supported: true, matviews: await driver.listMatViews(schema) })
+    } catch (err) {
+      return fail(err)
+    }
+  })
+
+  ipcMain.handle(IPC.listTypes, async (_e, id: string, schema: string) => {
+    try {
+      const driver = requireDriver(id)
+      if (driver.config.engine !== 'postgres' || !driver.listTypes) {
+        return ok({ supported: false, types: [], note: PG_ONLY })
+      }
+      return ok({ supported: true, types: await driver.listTypes(schema) })
+    } catch (err) {
+      return fail(err)
+    }
+  })
+
+  ipcMain.handle(IPC.listExtensions, async (_e, id: string) => {
+    try {
+      const driver = requireDriver(id)
+      if (driver.config.engine !== 'postgres' || !driver.listExtensions) {
+        return ok({ supported: false, installed: [], available: [], note: PG_ONLY })
+      }
+      const { installed, available } = await driver.listExtensions()
+      return ok({ supported: true, installed, available })
+    } catch (err) {
+      return fail(err)
+    }
+  })
+
   // --- Import / Export ---
   ipcMain.handle(IPC.exportData, async (e, req: ExportRequest) => {
     try {
@@ -639,6 +736,31 @@ export function registerIpc(): void {
       const columnTypes: Record<string, string> = {}
       for (const c of spec.columns) columnTypes[c.name] = c.type
       return ok(await runImport(driver, { columnTypes, primaryKey: spec.primaryKey }, req))
+    } catch (err) {
+      return fail(err)
+    }
+  })
+
+  // --- Cross-engine data transfer (any connection → any other) ---
+  ipcMain.handle(IPC.transferPlan, async (_e, req: TransferPlanRequest) => {
+    try {
+      const source = requireDriver(req.sourceConnectionId)
+      const target = requireDriver(req.targetConnectionId)
+      return ok(await buildTransferPlan(source, target, req))
+    } catch (err) {
+      return fail(err)
+    }
+  })
+
+  ipcMain.handle(IPC.transferRun, async (e, req: TransferRequest) => {
+    try {
+      const source = requireDriver(req.sourceConnectionId)
+      const target = requireDriver(req.targetConnectionId)
+      const res = await runTransfer(source, target, req, (done, total) =>
+        e.sender.send(IPC.ioProgress, { phase: 'transfer', done, total })
+      )
+      catalogCache.delete(req.targetConnectionId) // target structure changed
+      return ok(res)
     } catch (err) {
       return fail(err)
     }

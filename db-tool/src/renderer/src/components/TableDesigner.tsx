@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { ColumnSpec, ForeignKeySpec, IndexSpec, TableSpec } from '@shared/types'
 import { sqlDialect } from '@shared/types'
 import {
@@ -19,6 +19,19 @@ export function TableDesigner(): JSX.Element {
   const engineOf = useStore((s) => s.engineOf)
   const catalogByConn = useStore((s) => s.catalogByConn)
   const [confirmText, setConfirmText] = useState('')
+  // PostgreSQL user-defined types (enums/composites) offered in the type dropdown.
+  const [userTypes, setUserTypes] = useState<string[]>([])
+  const connId = tab?.connectionId ?? null
+  const schema = tab?.designer?.spec.schema ?? ''
+  const engineName = connId ? engineOf(connId) : null
+  useEffect(() => {
+    if (engineName !== 'postgres' || !connId || !schema) { setUserTypes([]); return }
+    let cancelled = false
+    void window.dbApi.listTypes(connId, schema).then((r) => {
+      if (!cancelled && r.ok && r.data.supported) setUserTypes(r.data.types.map((t) => t.name))
+    })
+    return () => { cancelled = true }
+  }, [engineName, connId, schema])
 
   if (!tab?.designer) return <div className="empty">No designer open.</div>
   const { spec, mode, preview, applying, message } = tab.designer
@@ -239,7 +252,14 @@ export function TableDesigner(): JSX.Element {
                         </optgroup>
                       )
                     })}
-                    {!findType(engine, c.type) && <option value={c.type}>{c.type} (raw)</option>}
+                    {userTypes.length > 0 && (
+                      <optgroup label="User types">
+                        {userTypes.map((t) => (
+                          <option key={'ut.' + t} value={t}>{t}</option>
+                        ))}
+                      </optgroup>
+                    )}
+                    {!findType(engine, c.type) && !userTypes.includes(c.type) && <option value={c.type}>{c.type} (raw)</option>}
                   </select>
                 </td>
                 <td>{renderParams(c, i)}</td>

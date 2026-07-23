@@ -360,6 +360,34 @@ export class SqliteDriver implements DbDriver {
     return this.execStatements(statements)
   }
 
+  async transferInsert(
+    _schema: string,
+    table: string,
+    columns: string[],
+    rows: unknown[][],
+    columnTypes: Record<string, string>,
+    _identityCols: string[]
+  ): Promise<number> {
+    if (rows.length === 0) return 0
+    const db = this.ensure()
+    const t = qid(table)
+    const colList = columns.map(qid).join(', ')
+    const rowPh = '(' + columns.map(() => '?').join(', ') + ')'
+    // Stay under SQLite's default SQLITE_MAX_VARIABLE_NUMBER (999 on older builds).
+    const perChunk = Math.max(1, Math.floor(900 / columns.length))
+    const chunks: unknown[][][] = []
+    for (let i = 0; i < rows.length; i += perChunk) chunks.push(rows.slice(i, i + perChunk))
+    const bind = (row: unknown[]): unknown[] => row.map((v, c) => coerceForWrite(v, columnTypes[columns[c]]))
+    const run = db.transaction((cs: unknown[][][]) => {
+      for (const chunk of cs) {
+        const placeholders = chunk.map(() => rowPh).join(', ')
+        db.prepare(`INSERT INTO ${t} (${colList}) VALUES ${placeholders}`).run(...chunk.flatMap(bind))
+      }
+    })
+    run(chunks) // better-sqlite3 auto-rolls-back on throw
+    return rows.length
+  }
+
   async listViews(_schema: string): Promise<ViewRef[]> {
     const rows = this.ensure()
       .prepare(`SELECT name FROM sqlite_master WHERE type='view' AND name NOT LIKE 'sqlite_%' ORDER BY name COLLATE NOCASE`)

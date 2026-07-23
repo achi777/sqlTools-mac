@@ -39,6 +39,7 @@ export function ConnectionManager(): JSX.Element {
   const saveConnection = useStore((s) => s.saveConnection)
   const deleteConnection = useStore((s) => s.deleteConnection)
   const setSidebarCollapsed = useStore((s) => s.setSidebarCollapsed)
+  const newConnSignal = useStore((s) => s.newConnSignal)
 
   const [showForm, setShowForm] = useState(false)
   const [isEditing, setIsEditing] = useState(false)
@@ -46,10 +47,24 @@ export function ConnectionManager(): JSX.Element {
   const [testMsg, setTestMsg] = useState<{ ok: boolean; text: string } | null>(null)
   const [testing, setTesting] = useState(false)
   const [confirmDel, setConfirmDel] = useState<SafeConnectionConfig | null>(null)
+  const [secureAvailable, setSecureAvailable] = useState(true)
 
   useEffect(() => {
     void refreshConnections()
+    void window.dbApi.secureStorageAvailable().then(setSecureAvailable)
   }, [refreshConnections])
+
+  // File ▸ New Connection (native menu, TASK 72) bumps newConnSignal — reveal the
+  // sidebar and open the add-connection form, exactly like the in-app button.
+  useEffect(() => {
+    if (newConnSignal === 0) return
+    setSidebarCollapsed(false)
+    startAdd()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [newConnSignal])
+
+  // Whether the connection being edited already has a stored (encrypted) secret.
+  const editingHasPassword = isEditing && !!(form as SafeConnectionConfig).hasStoredPassword && !form.clearPassword
 
   // Every default is seeded as a real saved connection in main, so the list is
   // simply the saved connections — all with the same action set.
@@ -73,7 +88,7 @@ export function ConnectionManager(): JSX.Element {
   // Edit an existing connection: prefill everything except the password (which
   // the renderer never receives — blank means "keep the stored one").
   function startEdit(c: SafeConnectionConfig): void {
-    setForm({ ...blankForm(), ...c, password: '' })
+    setForm({ ...blankForm(), ...c, password: '', clearPassword: false })
     setIsEditing(true)
     setTestMsg(null)
     setShowForm(true)
@@ -96,6 +111,12 @@ export function ConnectionManager(): JSX.Element {
     const saved = await saveConnection(form)
     if (!saved) {
       setTestMsg({ ok: false, text: 'Save failed' })
+      return
+    }
+    if (saved.warning) {
+      // Secure storage unavailable — the secret wasn't persisted. Keep the form
+      // open with the warning so the user knows.
+      setTestMsg({ ok: false, text: saved.warning })
       return
     }
     setShowForm(false)
@@ -239,9 +260,29 @@ export function ConnectionManager(): JSX.Element {
                       <input
                         type="password"
                         value={form.password ?? ''}
-                        placeholder={isEditing ? 'leave blank to keep current' : ''}
+                        disabled={!!form.clearPassword}
+                        placeholder={
+                          form.clearPassword ? '(will be cleared)'
+                          : editingHasPassword ? '••••••••• (unchanged)'
+                          : ''
+                        }
                         onChange={(e) => update('password', e.target.value)}
                       />
+                      {editingHasPassword && (
+                        <label className="param-check" style={{ display: 'flex', gap: 6, marginTop: 4 }}>
+                          <input
+                            type="checkbox"
+                            checked={!!form.clearPassword}
+                            onChange={(e) => setForm((f) => ({ ...f, clearPassword: e.target.checked, password: '' }))}
+                          />
+                          Clear stored password
+                        </label>
+                      )}
+                      {!secureAvailable && (
+                        <div className="msg err" style={{ marginTop: 4 }}>
+                          ⚠ Secure storage unavailable — passwords cannot be encrypted and will not be saved. Enter it each session.
+                        </div>
+                      )}
                     </div>
                   </>
                 )}
@@ -281,21 +322,26 @@ export function ConnectionManager(): JSX.Element {
                   <div className="field">
                     <label>Options</label>
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                      <label className="param-check" style={{ display: 'flex', gap: 6 }}>
+                      <label className="param-check" style={{ display: 'flex', gap: 6 }} title="Encrypt the connection with TLS" aria-label="Encrypt connection (TLS)">
                         <input
                           type="checkbox"
                           checked={form.encrypt ?? true}
                           onChange={(e) => update('encrypt', e.target.checked)}
                         />
-                        Encrypt connection (TLS)
+                        Encrypt (TLS)
                       </label>
-                      <label className="param-check" style={{ display: 'flex', gap: 6 }}>
+                      <label
+                        className="param-check"
+                        style={{ display: 'flex', gap: 6 }}
+                        title="Needed for local or self-signed certificates"
+                        aria-label="Trust server certificate — needed for local or self-signed certificates"
+                      >
                         <input
                           type="checkbox"
                           checked={form.trustServerCertificate ?? true}
                           onChange={(e) => update('trustServerCertificate', e.target.checked)}
                         />
-                        Trust server certificate (needed for local/self-signed)
+                        Trust server certificate
                       </label>
                     </div>
                   </div>

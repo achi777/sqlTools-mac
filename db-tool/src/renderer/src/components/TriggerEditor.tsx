@@ -23,6 +23,7 @@ export function TriggerEditor(): JSX.Element {
   const engineOf = useStore((s) => s.engineOf)
   const setTriggerEditor = useStore((s) => s.setTriggerEditor)
   const applyTriggerEditor = useStore((s) => s.applyTriggerEditor)
+  const theme = useStore((s) => s.theme)
 
   if (!tab?.triggerEditor) return <div className="empty">No trigger open.</div>
   const te = tab.triggerEditor
@@ -114,7 +115,7 @@ export function TriggerEditor(): JSX.Element {
               <div className="trg-cm">
                 <CodeMirror
                   value={spec.functionBody}
-                  theme="dark"
+                  theme={theme}
                   extensions={[sql()]}
                   onChange={(v) => patch({ functionBody: v })}
                   basicSetup={{ lineNumbers: true, foldGutter: false, autocompletion: true }}
@@ -142,7 +143,7 @@ export function TriggerEditor(): JSX.Element {
               <div className="trg-cm">
                 <CodeMirror
                   value={spec.body}
-                  theme="dark"
+                  theme={theme}
                   extensions={[sql()]}
                   onChange={(v) => patch({ body: v })}
                   basicSetup={{ lineNumbers: true, foldGutter: false, autocompletion: true }}

@@ -77,6 +77,19 @@ function ErDiagramInner(): JSX.Element {
   const openNewTableDesigner = useStore((s) => s.openNewTableDesigner)
   const openEditTableDesigner = useStore((s) => s.openEditTableDesigner)
   const refreshErSchema = useStore((s) => s.refreshErSchema)
+  const themeMode = useStore((s) => s.theme)
+  // Theme-aware colors for React Flow inline styles (edges/minimap/export).
+  const erColors = useMemo(() => {
+    const dark = themeMode === 'dark'
+    return {
+      edge: dark ? '#7c9cff' : '#3b6fe0',
+      label: dark ? '#b9c0e0' : '#3a4055',
+      labelBg: dark ? '#22222f' : '#eceef2',
+      miniNode: dark ? '#3a3a52' : '#c8ccd6',
+      miniMask: dark ? 'rgba(20,20,30,0.6)' : 'rgba(210,215,225,0.5)',
+      exportBg: dark ? '#1e1e2a' : '#f6f7f9'
+    }
+  }, [themeMode])
   const rf = useReactFlow()
   const updateNodeInternals = useUpdateNodeInternals()
 
@@ -234,17 +247,17 @@ function ErDiagramInner(): JSX.Element {
           targetHandle: '__node:target',
           type: 'smoothstep',
           label: `${childCol} → ${refCol}`,
-          labelStyle: { fill: '#b9c0e0', fontSize: 9 },
-          labelBgStyle: { fill: '#22222f' },
+          labelStyle: { fill: erColors.label, fontSize: 9 },
+          labelBgStyle: { fill: erColors.labelBg },
           labelShowBg: true,
-          markerEnd: { type: MarkerType.ArrowClosed, width: 16, height: 16, color: '#7c9cff' },
-          style: { stroke: '#7c9cff', strokeWidth: 1.5 },
+          markerEnd: { type: MarkerType.ArrowClosed, width: 16, height: 16, color: erColors.edge },
+          style: { stroke: erColors.edge, strokeWidth: 1.5 },
           data: { childTable: t.name, fkName: fk.name ?? null, fkIndex: fi }
         })
       })
     }
     return out
-  }, [model])
+  }, [model, erColors])
 
   // --- Drag/position changes -------------------------------------------------
   const onNodesChange = (changes: NodeChange[]): void => {
@@ -438,7 +451,7 @@ function ErDiagramInner(): JSX.Element {
     const imgH = Math.min(4096, Math.max(300, Math.round(bounds.height + pad * 2)))
     const t = getViewportForBounds(bounds, imgW, imgH, 0.2, 2, pad)
     const opts = {
-      backgroundColor: '#1e1e2a',
+      backgroundColor: erColors.exportBg,
       width: imgW,
       height: imgH,
       style: {
@@ -540,17 +553,17 @@ function ErDiagramInner(): JSX.Element {
             onNodeDoubleClick={onNodeDoubleClick}
             connectionMode={ConnectionMode.Loose}
             connectionLineType={ConnectionLineType.SmoothStep}
-            connectionLineStyle={{ stroke: '#7c9cff', strokeWidth: 2 }}
+            connectionLineStyle={{ stroke: erColors.edge, strokeWidth: 2 }}
             connectionRadius={55}
             fitView
             fitViewOptions={{ maxZoom: 1 }}
-            colorMode="dark"
+            colorMode={themeMode}
             minZoom={0.1}
             defaultEdgeOptions={{ type: 'smoothstep' }}
           >
             <Background />
             <Controls />
-            <MiniMap pannable zoomable nodeColor="#3a3a52" maskColor="rgba(20,20,30,0.6)" />
+            <MiniMap pannable zoomable nodeColor={erColors.miniNode} maskColor={erColors.miniMask} />
             {model.tables.length === 0 && (
               <Panel position="top-center">
                 <div className="er-hint">No tables in this schema yet. Use “＋ New table”.</div>

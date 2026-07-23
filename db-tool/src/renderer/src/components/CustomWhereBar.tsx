@@ -18,6 +18,7 @@ export function CustomWhereBar(): JSX.Element | null {
   const clearActive = useStore((s) => s.clearAllFilters)
   const catalogByConn = useStore((s) => s.catalogByConn)
   const engineOf = useStore((s) => s.engineOf)
+  const theme = useStore((s) => s.theme)
 
   const connId = activeTab?.connectionId ?? null
   const catalog = connId ? catalogByConn[connId] : undefined
@@ -60,7 +61,7 @@ export function CustomWhereBar(): JSX.Element | null {
       <div className="cw-input">
         <CodeMirror
           value={text}
-          theme="dark"
+          theme={theme}
           height="auto"
           extensions={extensions}
           placeholder={`e.g.  amount > 100 AND status = 'active'`}

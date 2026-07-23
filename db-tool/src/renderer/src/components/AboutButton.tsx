@@ -1,8 +1,9 @@
 import { useEffect, useState, type MouseEvent } from 'react'
 import { IconInfo, IconClose } from '../actionIcons'
+import { useStore } from '../store'
 import type { AppInfo } from '@shared/types'
 
-const WEBSITE = 'https://www.codemake.com'
+const WEBSITE = 'https://codemake.co'
 const EMAIL = 'archil.odishelidze@gmail.com'
 
 /**
@@ -12,7 +13,10 @@ const EMAIL = 'archil.odishelidze@gmail.com'
  * Closes via ×, the Close button, Esc, or click-away.
  */
 export function AboutButton(): JSX.Element {
-  const [open, setOpen] = useState(false)
+  // Open state lives in the store so the native Help ▸ About menu (TASK 72) can
+  // drive the same dialog the status-bar info button opens.
+  const open = useStore((s) => s.aboutOpen)
+  const setOpen = useStore((s) => s.setAboutOpen)
   const [info, setInfo] = useState<AppInfo | null>(null)
 
   // Fetch product name + version lazily the first time it's opened.

@@ -508,6 +508,64 @@ export class MssqlDriver implements DbDriver {
     return { ok: true, executed }
   }
 
+  async transferInsert(
+    schema: string,
+    table: string,
+    columns: string[],
+    rows: unknown[][],
+    columnTypes: Record<string, string>,
+    identityCols: string[]
+  ): Promise<number> {
+    if (rows.length === 0) return 0
+    const t = this.qtable(schema, table)
+    const colList = columns.map(qid).join(', ')
+    // SQL Server caps a statement at 2100 parameters; keep chunks ≤ 1000 rows and
+    // under that param budget.
+    const perChunk = Math.max(1, Math.min(1000, Math.floor(2000 / columns.length)))
+    const identity = identityCols.length > 0
+    const tx = new sql.Transaction(this.ensure())
+    await tx.begin()
+    try {
+      // IDENTITY_INSERT is session-scoped; ON only inside this one transaction so
+      // the source's explicit identity values are preserved (never touches source).
+      // Use batch() (a direct T-SQL batch): request.query() runs via sp_executesql,
+      // whose SET is scoped to that dynamic-SQL call and would revert before INSERT.
+      if (identity) await new sql.Request(tx).batch(`SET IDENTITY_INSERT ${t} ON`)
+      for (let i = 0; i < rows.length; i += perChunk) {
+        const chunk = rows.slice(i, i + perChunk)
+        const r = new sql.Request(tx)
+        let p = 0
+        const tuples = chunk.map(
+          (row) =>
+            '(' +
+            row
+              .map((v, c) => {
+                p++
+                const val = coerceForWrite(v, columnTypes[columns[c]])
+                // Binary columns need an EXPLICIT VarBinary type: node-mssql infers
+                // a NULL (and sometimes a Buffer) as NVarChar, which SQL Server
+                // refuses to implicitly convert to varbinary.
+                if (/varbinary|\bbinary\b|blob|image|\braw\b/i.test(columnTypes[columns[c]] || '')) {
+                  r.input(`p${p}`, sql.VarBinary(sql.MAX), val as never)
+                } else {
+                  r.input(`p${p}`, val as never)
+                }
+                return `@p${p}`
+              })
+              .join(', ') +
+            ')'
+        )
+        await r.query(`INSERT INTO ${t} (${colList}) VALUES ${tuples.join(', ')}`)
+      }
+      if (identity) await new sql.Request(tx).batch(`SET IDENTITY_INSERT ${t} OFF`)
+      await tx.commit()
+      return rows.length
+    } catch (err) {
+      await tx.rollback().catch(() => undefined)
+      throw err
+    }
+  }
+
   async applyObjectSql(statements: string[]): Promise<DdlApplyResult> {
     return this.execStatements(statements)
   }

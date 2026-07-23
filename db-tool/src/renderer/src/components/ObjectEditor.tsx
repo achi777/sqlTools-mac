@@ -9,6 +9,7 @@ export function ObjectEditor(): JSX.Element {
   const engineOf = useStore((s) => s.engineOf)
   const setObjectEditor = useStore((s) => s.setObjectEditor)
   const applyObjectEditor = useStore((s) => s.applyObjectEditor)
+  const theme = useStore((s) => s.theme)
 
   if (!tab?.objectEditor) return <div className="empty">No object open.</div>
   const oe = tab.objectEditor
@@ -59,7 +60,7 @@ export function ObjectEditor(): JSX.Element {
       <div className="obj-body">
         <CodeMirror
           value={oe.body}
-          theme="dark"
+          theme={theme}
           extensions={[sql()]}
           onChange={(v) => set({ body: v })}
           basicSetup={{ lineNumbers: true, foldGutter: false, autocompletion: true }}

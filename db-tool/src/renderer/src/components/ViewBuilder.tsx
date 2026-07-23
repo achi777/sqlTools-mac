@@ -31,6 +31,16 @@ export function ViewBuilder(): JSX.Element {
   const setViewModel = useStore((s) => s.setViewModel)
   const previewViewBuilder = useStore((s) => s.previewViewBuilder)
   const saveViewBuilder = useStore((s) => s.saveViewBuilder)
+  const themeMode = useStore((s) => s.theme)
+  const vbColors = useMemo(() => {
+    const dark = themeMode === 'dark'
+    return {
+      edge: dark ? '#7c9cff' : '#3b6fe0',
+      edgeSel: dark ? '#4caf8f' : '#1f8a6d',
+      label: dark ? '#e4e4ef' : '#1f2330',
+      labelBg: dark ? '#2a2a3c' : '#eceef2'
+    }
+  }, [themeMode])
 
   const [rfNodes, setRfNodes] = useState<Node[]>([])
   const [addSel, setAddSel] = useState('')
@@ -139,13 +149,13 @@ export function ViewBuilder(): JSX.Element {
         target: visRightId,
         targetHandle: `${visRightCol}:target`,
         label: j.type,
-        labelStyle: { fill: '#e4e4ef', fontSize: 10 },
-        labelBgStyle: { fill: '#2a2a3c' },
-        style: { stroke: sel ? '#4caf8f' : '#7c9cff', strokeWidth: sel ? 2.5 : 1.5 }
+        labelStyle: { fill: vbColors.label, fontSize: 10 },
+        labelBgStyle: { fill: vbColors.labelBg },
+        style: { stroke: sel ? vbColors.edgeSel : vbColors.edge, strokeWidth: sel ? 2.5 : 1.5 }
       }
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [model, rfNodes, selectedJoin])
+  }, [model, rfNodes, selectedJoin, vbColors])
 
   const onNodesChange = (changes: NodeChange[]): void => {
     if (!model) return
@@ -419,11 +429,11 @@ export function ViewBuilder(): JSX.Element {
             }}
             onPaneClick={() => setSelectedJoin(null)}
             connectionLineType={ConnectionLineType.SmoothStep}
-            connectionLineStyle={{ stroke: '#7c9cff', strokeWidth: 2 }}
+            connectionLineStyle={{ stroke: vbColors.edge, strokeWidth: 2 }}
             connectionRadius={55}
             fitView
             fitViewOptions={{ maxZoom: 1 }}
-            colorMode="dark"
+            colorMode={themeMode}
             defaultEdgeOptions={{ type: 'smoothstep' }}
           >
             <Background />

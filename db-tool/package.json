@@ -3,7 +3,11 @@
   "version": "0.1.0",
   "description": "Navicat-style desktop database tool — first vertical slice (Electron + React + TS)",
   "main": "./out/main/index.js",
-  "author": "db-tool",
+  "author": {
+    "name": "ALL PAY WAY, LLC",
+    "email": "ceo@apw.ge"
+  },
+  "homepage": "https://github.com/achi777/sqlTools",
   "license": "MIT",
   "private": true,
   "type": "module",
@@ -19,7 +23,9 @@
     "package": "electron-vite build && electron-builder --win",
     "package:dir": "electron-vite build && electron-builder --win --dir",
     "package:mac": "electron-vite build && electron-builder --mac",
-    "package:mac:dir": "electron-vite build && electron-builder --mac --dir"
+    "package:mac:dir": "electron-vite build && electron-builder --mac --dir",
+    "package:linux": "electron-vite build && electron-builder --linux",
+    "package:linux:dir": "electron-vite build && electron-builder --linux --dir"
   },
   "dependencies": {
     "@dagrejs/dagre": "^3.0.0",

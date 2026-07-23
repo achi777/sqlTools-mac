@@ -1,9 +1,14 @@
 // Electron MAIN entry. Creates the window with a locked-down webPreferences,
 // registers typed IPC handlers, and wires lifecycle. NO DB code lives inline
 // here — it's all behind the drivers/IPC layer.
-import { app, BrowserWindow, shell } from 'electron'
+import { app, BrowserWindow, Menu, ipcMain, shell } from 'electron'
 import { join } from 'node:path'
 import { disposeAll, registerIpc } from './ipc'
+import { buildAppMenu } from './menu'
+import { loadUiState } from './store'
+import { IPC, type ThemeMode } from '@shared/types'
+
+let mainWin: BrowserWindow | null = null
 
 const isDev = !!process.env['ELECTRON_RENDERER_URL']
 
@@ -20,7 +25,8 @@ function createWindow(): void {
     height: 820,
     show: false,
     title: 'DB Tool',
-    autoHideMenuBar: true,
+    // TASK 72: show the native application menu bar (discoverable Theme/About/etc.).
+    autoHideMenuBar: false,
     webPreferences: {
       preload: join(__dirname, '../preload/index.cjs'),
       // Security posture required by the task: renderer is fully isolated and
@@ -31,7 +37,14 @@ function createWindow(): void {
     }
   })
 
+  mainWin = win
   win.on('ready-to-show', () => win.show())
+
+  // TASK 72: native application menu, additive — its items dispatch the SAME
+  // actions the in-app buttons use. The View ▸ Theme checkmark reflects the
+  // persisted theme; the renderer notifies MAIN on change to refresh it.
+  const theme: ThemeMode = loadUiState().theme === 'light' ? 'light' : 'dark'
+  Menu.setApplicationMenu(buildAppMenu(win, theme))
 
   // Open external links in the OS browser, never in-app.
   win.webContents.setWindowOpenHandler(({ url }) => {
@@ -63,6 +76,11 @@ app.whenReady().then(async () => {
   }
 
   registerIpc()
+  // Rebuild the menu when the renderer changes the theme, so the View ▸ Theme
+  // checkmark stays in sync (whether toggled from the menu or the status bar).
+  ipcMain.on(IPC.menuThemeChanged, (_e, theme: ThemeMode) => {
+    if (mainWin) Menu.setApplicationMenu(buildAppMenu(mainWin, theme === 'light' ? 'light' : 'dark'))
+  })
   createWindow()
 
   app.on('activate', () => {

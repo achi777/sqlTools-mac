@@ -17,6 +17,8 @@ export function IndexEditor(): JSX.Element {
   const spec = ie.spec
   const engine = engineOf(tab.connectionId) ?? 'postgres'
   const isEdit = ie.mode === 'edit'
+  const isPg = engine === 'postgres' // advanced method/partial/expression are PG-only
+  const usingExpr = isPg && !!(spec.expression && spec.expression.trim())
 
   const catalog = tab.connectionId ? catalogByConn[tab.connectionId] : undefined
   const tableCols =
@@ -53,6 +55,18 @@ export function IndexEditor(): JSX.Element {
         <label className="param-check">
           <input type="checkbox" checked={spec.unique} onChange={(e) => patch({ unique: e.target.checked })} /> UNIQUE
         </label>
+        {isPg && (
+          <label className="seq-field" title="PostgreSQL index access method">
+            <span>method</span>
+            <select value={spec.method ?? 'btree'} onChange={(e) => patch({ method: e.target.value as IndexCreateSpec['method'] })}>
+              <option value="btree">btree</option>
+              <option value="hash">hash</option>
+              <option value="gin">gin</option>
+              <option value="gist">gist</option>
+              <option value="brin">brin</option>
+            </select>
+          </label>
+        )}
         <span className="on-tbl">ON <b>{spec.table}</b></span>
         <span className="spacer" />
         {isEdit && (
@@ -84,6 +98,7 @@ export function IndexEditor(): JSX.Element {
           <div className="idx-add">
             <select
               value=""
+              disabled={usingExpr}
               onChange={(e) => {
                 if (e.target.value) setCols([...spec.columns, e.target.value])
               }}
@@ -94,6 +109,26 @@ export function IndexEditor(): JSX.Element {
               ))}
             </select>
           </div>
+
+          {isPg && (
+            <div className="idx-pg-adv">
+              <div className="section-title">Expression index (optional)</div>
+              <input
+                className="idx-expr"
+                placeholder="e.g. lower(email) — overrides the columns above"
+                value={spec.expression ?? ''}
+                onChange={(e) => patch({ expression: e.target.value })}
+              />
+              <div className="section-title">Partial index — WHERE (optional)</div>
+              <input
+                className="idx-expr"
+                placeholder="e.g. active AND deleted_at IS NULL"
+                value={spec.where ?? ''}
+                onChange={(e) => patch({ where: e.target.value })}
+              />
+              {usingExpr && <div className="idx-empty">Using the expression above; the column list is ignored.</div>}
+            </div>
+          )}
         </div>
 
         <div className="idx-preview">

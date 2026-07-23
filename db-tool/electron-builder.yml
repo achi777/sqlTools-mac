@@ -3,14 +3,9 @@
 # End users need NO Node.js — the Electron runtime is bundled.
 appId: com.dbtool.app
 productName: DB Tool
-# No auto-update server configured; disable publish to avoid channel errors.
 publish: null
-# Copyright shown in the exe metadata.
 copyright: Copyright © 2026 DB Tool
 
-# The built app lives in ./out (electron-vite output). We ship that plus the
-# whitelisted production node_modules (drivers). package.json "main" points at
-# out/main/index.js.
 directories:
   output: release
   buildResources: build
@@ -18,18 +13,10 @@ directories:
 files:
   - out/**
   - package.json
-  # Production dependencies (pg, mysql2, better-sqlite3 + their deps) are
-  # included automatically by electron-builder; devDependencies are excluded.
 
-# Native module rebuild. On macOS Xcode CLT provides a C++ toolchain so
-# electron-builder can recompile better-sqlite3 for the correct Electron ABI
-# automatically. On Windows without a toolchain set this to false and use a
-# prebuilt binary instead (see README).
 npmRebuild: true
 nodeGypRebuild: false
 
-# Native .node binaries cannot be loaded from inside an asar archive, so unpack
-# better-sqlite3 (and any other .node) into app.asar.unpacked/.
 asar: true
 asarUnpack:
   - "**/*.node"
@@ -55,10 +42,18 @@ mac:
         - arm64
         - x64
 
+linux:
+  icon: build/icon.png
+  artifactName: DBTool-${version}-${arch}-linux.${ext}
+  category: Development
+  target:
+    - target: AppImage
+      arch:
+        - x64
+
 win:
   icon: build/icon.ico
   artifactName: DBTool-${version}-${arch}-win.${ext}
-  # No code signing (unsigned build — see README). Explicitly avoid any signing.
   signAndEditExecutable: true
   target:
     - target: nsis

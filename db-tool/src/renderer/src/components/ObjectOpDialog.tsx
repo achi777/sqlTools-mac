@@ -16,6 +16,12 @@ function targetName(op: ObjectOp): string {
     case 'dropSequence':
     case 'dropTrigger':
     case 'dropIndex':
+    case 'dropMatView':
+    case 'refreshMatView':
+    case 'dropType':
+    case 'createExtension':
+    case 'updateExtension':
+    case 'dropExtension':
       return op.name
     case 'dropTable':
     case 'truncateTable':
@@ -55,7 +61,13 @@ export function ObjectOpDialog(): JSX.Element | null {
     dropPackageBody: 'Drop package body',
     dropSequence: 'Drop sequence',
     dropTrigger: 'Drop trigger',
-    dropIndex: 'Drop index'
+    dropIndex: 'Drop index',
+    dropMatView: 'Drop materialized view',
+    refreshMatView: 'Refresh materialized view',
+    dropType: 'Drop type',
+    createExtension: 'Create extension',
+    updateExtension: 'Update extension',
+    dropExtension: 'Drop extension'
   }
 
   return (
