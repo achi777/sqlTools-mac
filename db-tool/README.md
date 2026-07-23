@@ -607,3 +607,20 @@ filters, a nested AND/OR visual filter builder, views + functions/procedures
 management, and a drag-and-drop visual view builder across PG/MySQL/SQLite;
 packaging / installers (electron-builder, see above).
 ```
+## License
+
+DBTool is dual-licensed:
+
+- **Open Source:** [GNU AGPL-3.0](LICENSE) — free for open-source use. Any derivative work or network deployment must publish its complete source code under the same license.
+- **Commercial:** A proprietary license is available for closed-source or commercial use. See [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md) for details.
+
+To obtain a commercial license, contact: **archil.odishelidze@gmail.com**
+
+### SPDX Header (for source files)
+
+The following header should be added to the top of each source file:
+
+```
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 Archil Odishelidze / CodeMake
+```

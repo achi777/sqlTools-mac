@@ -8,7 +8,7 @@
     "email": "ceo@apw.ge"
   },
   "homepage": "https://github.com/achi777/sqlTools",
-  "license": "MIT",
+  "license": "AGPL-3.0-only",
   "private": true,
   "type": "module",
   "scripts": {
